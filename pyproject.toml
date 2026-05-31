@@ -42,6 +42,9 @@ dev = [
     "mypy>=1.10",
     "ruff>=0.4",
 ]
+benchmark = [
+    "blake3~=1.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -62,9 +65,15 @@ python_version = "3.11"
 strict = true
 files = ["src/"]
 
+[[tool.mypy.overrides]]
+# blake3 is an optional runtime dependency with no stub package.
+# The benchmark command uses it dynamically; strict checking is not useful here.
+module = "fcompare.commands.benchmark"
+ignore_errors = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--tb=short"
 
 [tool.coverage.run]
-source = ["src/fcompare"]
+source_pkgs = ["fcompare"]

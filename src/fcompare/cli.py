@@ -3,6 +3,7 @@
 import typer
 
 from fcompare import __version__
+from fcompare.commands.benchmark import benchmark_cmd
 from fcompare.commands.diff import diff_cmd
 from fcompare.commands.dupes import dupes_cmd
 
@@ -36,3 +37,4 @@ def main(
 
 app.command("diff")(diff_cmd)
 app.command("dupes")(dupes_cmd)
+app.command("benchmark")(benchmark_cmd)
