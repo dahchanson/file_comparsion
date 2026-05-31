@@ -6,7 +6,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from fcompare.engine.fs_info import NETWORK_FS_TYPES, fs_type, is_network_fs
+from fcompare.engine.fs_info import (
+    LOCAL_FS_TYPES,
+    NETWORK_FS_TYPES,
+    fs_type,
+    is_local_fs,
+    is_mmap_safe,
+    is_network_fs,
+)
 
 
 def _mock_stat(fs_name: str) -> MagicMock:
@@ -68,7 +75,6 @@ class TestFsType:
         ) as mock_run:
             fs_type(tmp_path)
             fs_type(tmp_path)
-        # subprocess.run called only once despite two fs_type calls.
         assert mock_run.call_count == 1
 
     def test_cache_is_independent_per_path(self, tmp_path: Path) -> None:
@@ -81,7 +87,6 @@ class TestFsType:
         ) as mock_run:
             fs_type(path_a)
             fs_type(path_b)
-        # Different resolved paths → two subprocess calls.
         assert mock_run.call_count == 2
 
 
@@ -99,38 +104,109 @@ class TestIsNetworkFs:
         with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat(fsname)):
             assert is_network_fs(tmp_path) is True
 
-    @pytest.mark.parametrize("fsname", ["apfs", "hfs", "exfat", "msdos", "ntfs", "unknown"])
-    def test_false_for_local_fs_types(self, tmp_path: Path, fsname: str) -> None:
+    @pytest.mark.parametrize("fsname", sorted(LOCAL_FS_TYPES) + ["unknown"])
+    def test_false_for_local_and_unknown_fs_types(self, tmp_path: Path, fsname: str) -> None:
         with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat(fsname)):
             assert is_network_fs(tmp_path) is False
 
-    def test_false_when_fs_type_returns_unknown(self, tmp_path: Path) -> None:
+    def test_false_when_subprocess_raises(self, tmp_path: Path) -> None:
         with patch(
             "fcompare.engine.fs_info.subprocess.run", side_effect=OSError("unreachable")
         ):
             assert is_network_fs(tmp_path) is False
 
-    def test_smbfs_is_network(self, tmp_path: Path) -> None:
+
+# ---------------------------------------------------------------------------
+# is_local_fs
+# ---------------------------------------------------------------------------
+
+
+class TestIsLocalFs:
+    def setup_method(self) -> None:
+        _clear_cache()
+
+    @pytest.mark.parametrize("fsname", sorted(LOCAL_FS_TYPES))
+    def test_true_for_all_local_fs_types(self, tmp_path: Path, fsname: str) -> None:
+        with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat(fsname)):
+            assert is_local_fs(tmp_path) is True
+
+    def test_true_for_apfs_encrypted_and_unencrypted(self, tmp_path: Path) -> None:
+        # macOS reports "apfs" for both; encryption is transparent at the storage layer.
+        with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat("apfs")):
+            assert is_local_fs(tmp_path) is True
+
+    @pytest.mark.parametrize("fsname", sorted(NETWORK_FS_TYPES))
+    def test_false_for_all_network_fs_types(self, tmp_path: Path, fsname: str) -> None:
+        with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat(fsname)):
+            assert is_local_fs(tmp_path) is False
+
+    def test_false_for_unknown(self, tmp_path: Path) -> None:
+        with patch("fcompare.engine.fs_info.subprocess.run", side_effect=OSError("no stat")):
+            assert is_local_fs(tmp_path) is False
+
+    def test_local_and_network_sets_are_disjoint(self) -> None:
+        assert LOCAL_FS_TYPES.isdisjoint(NETWORK_FS_TYPES)
+
+
+# ---------------------------------------------------------------------------
+# is_mmap_safe
+# ---------------------------------------------------------------------------
+
+
+class TestIsMmapSafe:
+    def setup_method(self) -> None:
+        _clear_cache()
+
+    @pytest.mark.parametrize("fsname", sorted(LOCAL_FS_TYPES))
+    def test_true_for_all_local_fs_types(self, tmp_path: Path, fsname: str) -> None:
+        with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat(fsname)):
+            assert is_mmap_safe(tmp_path) is True
+
+    def test_true_for_apfs(self, tmp_path: Path) -> None:
+        with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat("apfs")):
+            assert is_mmap_safe(tmp_path) is True
+
+    @pytest.mark.parametrize("fsname", sorted(NETWORK_FS_TYPES))
+    def test_false_for_all_network_fs_types(self, tmp_path: Path, fsname: str) -> None:
+        with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat(fsname)):
+            assert is_mmap_safe(tmp_path) is False
+
+    def test_false_for_smbfs(self, tmp_path: Path) -> None:
         with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat("smbfs")):
-            assert is_network_fs(tmp_path) is True
+            assert is_mmap_safe(tmp_path) is False
 
-    def test_nfs_is_network(self, tmp_path: Path) -> None:
-        with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_stat("nfs")):
-            assert is_network_fs(tmp_path) is True
+    def test_false_for_unknown(self, tmp_path: Path) -> None:
+        with patch("fcompare.engine.fs_info.subprocess.run", side_effect=OSError("no stat")):
+            assert is_mmap_safe(tmp_path) is False
 
 
 # ---------------------------------------------------------------------------
-# NETWORK_FS_TYPES constant
+# Constants
 # ---------------------------------------------------------------------------
 
 
-class TestNetworkFsTypes:
-    def test_is_frozenset(self) -> None:
+class TestFsTypeConstants:
+    def test_network_fs_types_is_frozenset(self) -> None:
         assert isinstance(NETWORK_FS_TYPES, frozenset)
 
-    def test_all_lowercase(self) -> None:
-        assert all(name == name.lower() for name in NETWORK_FS_TYPES)
+    def test_local_fs_types_is_frozenset(self) -> None:
+        assert isinstance(LOCAL_FS_TYPES, frozenset)
 
-    def test_contains_expected_types(self) -> None:
+    def test_both_constants_all_lowercase(self) -> None:
+        for name in NETWORK_FS_TYPES | LOCAL_FS_TYPES:
+            assert name == name.lower()
+
+    def test_network_contains_expected_types(self) -> None:
         for expected in ("smbfs", "nfs", "afpfs", "cifs"):
             assert expected in NETWORK_FS_TYPES
+
+    def test_local_contains_expected_types(self) -> None:
+        for expected in ("apfs", "hfs", "exfat", "msdos", "ntfs"):
+            assert expected in LOCAL_FS_TYPES
+
+    def test_apfs_is_local_not_network(self) -> None:
+        assert "apfs" in LOCAL_FS_TYPES
+        assert "apfs" not in NETWORK_FS_TYPES
+
+    def test_sets_are_disjoint(self) -> None:
+        assert LOCAL_FS_TYPES.isdisjoint(NETWORK_FS_TYPES)
