@@ -75,7 +75,7 @@ def _has_hidden_component(path: Path, root: Path) -> bool:
     """Return True if any component of path (relative to root) starts with '.'."""
     try:
         rel = path.relative_to(root)
-    except ValueError:
+    except ValueError:  # pragma: no cover — path always comes from root.rglob()
         return False
     return any(part.startswith(".") for part in rel.parts)
 

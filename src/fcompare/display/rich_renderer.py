@@ -104,4 +104,4 @@ def _human_bytes(n: int) -> str:
         if value < 1024.0 or unit == "TB":
             return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024.0
-    return f"{value:.1f} PB"
+    return f"{value:.1f} PB"  # pragma: no cover — TB branch always exits the loop first

@@ -211,3 +211,34 @@ class TestDiffCLI:
         parsed = json.loads(result.output)
         assert "modified" in parsed
         assert "identical" not in parsed
+
+    def test_diff_rich_shows_only_left_and_only_right_markers(self, tmp_path: Path) -> None:
+        left = tmp_path / "left"
+        right = tmp_path / "right"
+        make_tree(left, {"left_only.txt": "L"})
+        make_tree(right, {"right_only.txt": "R"})
+
+        result = runner.invoke(app, ["diff", str(left), str(right)])
+
+        assert result.exit_code == 0
+        assert "only left" in result.output
+        assert "only right" in result.output
+
+    def test_diff_rich_show_filter_with_no_matches_shows_empty_message(
+        self, tmp_path: Path
+    ) -> None:
+        left = tmp_path / "left"
+        right = tmp_path / "right"
+        make_tree(left, {"f.txt": "same"})
+        make_tree(right, {"f.txt": "same"})
+
+        # --show modified but all files are identical → no rows.
+        result = runner.invoke(app, ["diff", str(left), str(right), "--show", "modified"])
+
+        assert result.exit_code == 0
+        assert "no files match" in result.output
+
+    def test_diff_version_flag_outputs_version(self) -> None:
+        result = runner.invoke(app, ["--version"])
+        assert result.exit_code == 0
+        assert "0.1.0" in result.output

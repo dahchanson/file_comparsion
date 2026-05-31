@@ -214,3 +214,41 @@ class TestWalkPermissionErrors:
         assert "good.txt" in names
         assert "bad.txt" not in names
         assert any("bad.txt" in str(w.message) for w in caught)
+
+    def test_permission_error_on_stat_emits_warning_and_continues(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        make_tree(tmp_path, {"good.txt": "g", "bad.txt": "b"})
+
+        original_stat = Path.stat
+        # is_symlink() calls stat(follow_symlinks=False) internally; so does the explicit
+        # entry.stat() call in the walker.  We let the first lstat call through (for
+        # is_symlink) and raise on the second (the walker's explicit stat call).
+        lstat_calls: dict[str, int] = {}
+
+        def flaky_stat(self: Path, *, follow_symlinks: bool = True) -> object:
+            if self.name == "bad.txt" and not follow_symlinks:
+                lstat_calls[str(self)] = lstat_calls.get(str(self), 0) + 1
+                if lstat_calls[str(self)] > 1:
+                    raise PermissionError("stat denied")
+            return original_stat(self, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(Path, "stat", flaky_stat)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            records = list(walk(tmp_path))
+
+        names = {r.rel_path.name for r in records}
+        assert "good.txt" in names
+        assert "bad.txt" not in names
+        assert any("bad.txt" in str(w.message) for w in caught)
+
+    def test_exclude_full_path_pattern_filters_nested_file(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {"keep.txt": "k", "sub": {"drop.txt": "d"}})
+        # Pattern matches full absolute path string, not just filename.
+        opts = WalkOptions(exclude_patterns=[str(tmp_path / "sub" / "drop.txt")])
+        records = list(walk(tmp_path, opts))
+        names = {r.rel_path.name for r in records}
+        assert "keep.txt" in names
+        assert "drop.txt" not in names

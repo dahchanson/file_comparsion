@@ -252,3 +252,32 @@ class TestDupesCLI:
         file_paths = parsed["groups"][0]["files"]
         assert len(file_paths) == 2
         assert all(str(tmp_path) in p for p in file_paths)
+
+    def test_dupes_rich_no_dupes_shows_no_duplicates_message(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {"a.txt": "unique_a", "b.txt": "unique_b"})
+
+        result = runner.invoke(app, ["dupes", str(tmp_path)])
+
+        assert result.exit_code == 0
+        assert "No duplicate" in result.output
+
+    def test_dupes_confirm_deletes_redundant_file(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {"a.txt": "same", "b.txt": "same"})
+
+        result = runner.invoke(
+            app, ["dupes", str(tmp_path), "--delete-keep", "first", "--confirm"]
+        )
+
+        assert result.exit_code == 0
+        remaining = [f for f in tmp_path.iterdir() if f.is_file()]
+        assert len(remaining) == 1
+        assert "deleted" in result.output
+
+    def test_dupes_delete_keep_no_dupes_reports_nothing_to_delete(self, tmp_path: Path) -> None:
+        # Single unique file — deletion plan has nothing to do.
+        make_tree(tmp_path, {"only.txt": "unique"})
+
+        result = runner.invoke(app, ["dupes", str(tmp_path), "--delete-keep", "oldest"])
+
+        assert result.exit_code == 0
+        assert (tmp_path / "only.txt").exists()
