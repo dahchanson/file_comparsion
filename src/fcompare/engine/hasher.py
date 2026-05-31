@@ -3,6 +3,7 @@
 import hashlib
 import os
 import warnings
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +30,7 @@ def hash_file(path: Path) -> str:
 def hash_records(
     records: list[FileRecord],
     max_workers: int | None = None,
+    on_file_hashed: Callable[[FileRecord], None] | None = None,
 ) -> list[FileRecord]:
     """Return a new list of FileRecords with the ``sha256`` field populated.
 
@@ -39,6 +41,9 @@ def hash_records(
     Args:
         records: FileRecords to hash. Each must have a valid ``path``.
         max_workers: Thread pool size. Defaults to os.cpu_count().
+        on_file_hashed: Optional callback invoked on the calling thread after
+            each file completes hashing. Receives the populated FileRecord.
+            Use this to drive progress bars without polling.
 
     Returns:
         New list of FileRecord instances (originals are not mutated).
@@ -62,6 +67,9 @@ def hash_records(
                     stacklevel=2,
                 )
                 continue
-            hashed.append(replace(record, sha256=digest))
+            hashed_record = replace(record, sha256=digest)
+            hashed.append(hashed_record)
+            if on_file_hashed is not None:
+                on_file_hashed(hashed_record)
 
     return hashed

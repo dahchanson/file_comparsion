@@ -6,6 +6,7 @@ import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from fcompare.display.progress import NoOpProgressReporter, ProgressReporter, make_reporter
 from fcompare.display.renderer import OutputFormat, ShowFilter, render_diff
 from fcompare.engine.hasher import hash_records
 from fcompare.engine.models import DiffResult
@@ -18,6 +19,7 @@ def compare_directories(
     left: Path,
     right: Path,
     options: WalkOptions,
+    reporter: ProgressReporter | NoOpProgressReporter | None = None,
 ) -> DiffResult:
     """Hash all files in both directory trees and classify differences.
 
@@ -29,16 +31,37 @@ def compare_directories(
         left: Left-hand directory root.
         right: Right-hand directory root.
         options: Walker configuration (recursion, exclusions, symlinks).
+        reporter: Progress reporter instance. Defaults to NoOpProgressReporter.
 
     Returns:
         DiffResult classifying every relative path as identical, modified,
         only-in-left, or only-in-right.
     """
-    left_records = hash_records(list(walk(left, options)))
-    right_records = hash_records(list(walk(right, options)))
+    rep = reporter or NoOpProgressReporter()
 
-    left_map = {str(r.rel_path): r for r in left_records}
-    right_map = {str(r.rel_path): r for r in right_records}
+    with rep.walk_phase(f"Scanning {left.name}…") as tick:
+        left_records = []
+        for r in walk(left, options):
+            tick(r)
+            left_records.append(r)
+
+    with rep.walk_phase(f"Scanning {right.name}…") as tick:
+        right_records = []
+        for r in walk(right, options):
+            tick(r)
+            right_records.append(r)
+
+    total_bytes = sum(r.size for r in left_records) + sum(r.size for r in right_records)
+    cb = rep.hash_phase(
+        total_files=len(left_records) + len(right_records),
+        total_bytes=total_bytes,
+    )
+
+    left_hashed = hash_records(left_records, on_file_hashed=cb)
+    right_hashed = hash_records(right_records, on_file_hashed=cb)
+
+    left_map = {str(r.rel_path): r for r in left_hashed}
+    right_map = {str(r.rel_path): r for r in right_hashed}
 
     result = DiffResult(left_root=left, right_root=right)
     all_keys = sorted(set(left_map) | set(right_map))
@@ -73,6 +96,9 @@ def diff_cmd(
         None, "--exclude", "-e", help="Glob pattern to exclude (repeatable)."
     ),
     follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks."),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Show per-file hashing progress."
+    ),
 ) -> None:
     """Compare two directories by SHA-256 hash and show differences."""
     options = WalkOptions(
@@ -81,13 +107,25 @@ def diff_cmd(
         exclude_patterns=exclude or [],
     )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=_console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Hashing files…", total=None)
-        result = compare_directories(left, right, options)
+    # Progress output is suppressed for JSON format — pipe consumers must not
+    # receive terminal escape sequences mixed into their data stream.
+    use_verbose = verbose and fmt != OutputFormat.json
+    reporter = make_reporter(use_verbose)
+
+    if use_verbose:
+        result = compare_directories(left, right, options, reporter)
+        reporter.stop()
+    elif fmt == OutputFormat.json:
+        # JSON piped output: run silently with no spinner.
+        result = compare_directories(left, right, options, reporter)
+    else:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=_console,
+            transient=True,
+        ) as progress:
+            progress.add_task("Hashing files…", total=None)
+            result = compare_directories(left, right, options, reporter)
 
     render_diff(result, fmt, show)

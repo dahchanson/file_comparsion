@@ -242,3 +242,45 @@ class TestDiffCLI:
         result = runner.invoke(app, ["--version"])
         assert result.exit_code == 0
         assert "0.1.0" in result.output
+
+    def test_diff_verbose_exits_zero_and_produces_results(self, tmp_path: Path) -> None:
+        left = tmp_path / "left"
+        right = tmp_path / "right"
+        make_tree(left, {"same.txt": "s", "changed.txt": "A", "left_only.txt": "L"})
+        make_tree(right, {"same.txt": "s", "changed.txt": "B", "right_only.txt": "R"})
+
+        result = runner.invoke(app, ["diff", str(left), str(right), "--verbose"])
+
+        assert result.exit_code == 0
+        # Result output must still be correct regardless of progress display.
+        assert "identical" in result.output
+        assert "modified" in result.output
+
+    def test_diff_verbose_json_suppresses_progress_output(self, tmp_path: Path) -> None:
+        # --verbose is silently ignored with --format json so pipe consumers
+        # receive clean JSON with no terminal escape sequences mixed in.
+        left = tmp_path / "left"
+        right = tmp_path / "right"
+        make_tree(left, {"f.txt": "hello"})
+        make_tree(right, {"f.txt": "hello"})
+
+        result = runner.invoke(
+            app, ["diff", str(left), str(right), "--verbose", "--format", "json"]
+        )
+
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert parsed["summary"]["identical"] == 1
+
+    def test_diff_verbose_result_matches_non_verbose(self, tmp_path: Path) -> None:
+        left = tmp_path / "left"
+        right = tmp_path / "right"
+        make_tree(left, {"a.txt": "x", "b.txt": "y"})
+        make_tree(right, {"a.txt": "x", "b.txt": "CHANGED"})
+
+        quiet = runner.invoke(app, ["diff", str(left), str(right), "--format", "json"])
+        verbose = runner.invoke(
+            app, ["diff", str(left), str(right), "--verbose", "--format", "json"]
+        )
+
+        assert json.loads(quiet.output)["summary"] == json.loads(verbose.output)["summary"]

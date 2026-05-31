@@ -281,3 +281,30 @@ class TestDupesCLI:
 
         assert result.exit_code == 0
         assert (tmp_path / "only.txt").exists()
+
+    def test_dupes_verbose_exits_zero_and_produces_results(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {"a.txt": "same", "b.txt": "same", "c.txt": "unique"})
+
+        result = runner.invoke(app, ["dupes", str(tmp_path), "--verbose"])
+
+        assert result.exit_code == 0
+        assert "dupe group" in result.output
+
+    def test_dupes_verbose_json_suppresses_progress_output(self, tmp_path: Path) -> None:
+        # --verbose is silently ignored with --format json so pipe consumers
+        # receive clean JSON with no terminal escape sequences mixed in.
+        make_tree(tmp_path, {"a.txt": "dup", "b.txt": "dup"})
+
+        result = runner.invoke(app, ["dupes", str(tmp_path), "--verbose", "--format", "json"])
+
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert parsed["summary"]["groups"] == 1
+
+    def test_dupes_verbose_result_matches_non_verbose(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {"a.txt": "dup", "b.txt": "dup", "c.txt": "unique"})
+
+        quiet = runner.invoke(app, ["dupes", str(tmp_path), "--format", "json"])
+        verbose = runner.invoke(app, ["dupes", str(tmp_path), "--verbose", "--format", "json"])
+
+        assert json.loads(quiet.output)["summary"] == json.loads(verbose.output)["summary"]

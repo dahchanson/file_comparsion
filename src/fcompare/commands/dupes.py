@@ -8,6 +8,7 @@ import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from fcompare.display.progress import NoOpProgressReporter, ProgressReporter, make_reporter
 from fcompare.display.renderer import OutputFormat, render_dupes
 from fcompare.engine.hasher import hash_records
 from fcompare.engine.models import DupeGroup, FileRecord
@@ -28,6 +29,7 @@ def find_duplicates(
     root: Path,
     options: WalkOptions,
     min_size: int = 1,
+    reporter: ProgressReporter | NoOpProgressReporter | None = None,
 ) -> list[DupeGroup]:
     """Return groups of files within ``root`` that share an identical SHA-256 digest.
 
@@ -42,8 +44,16 @@ def find_duplicates(
         root: Directory to search.
         options: Walker configuration (recursion, exclusions, symlinks).
         min_size: Skip files strictly smaller than this many bytes.
+        reporter: Progress reporter instance. Defaults to NoOpProgressReporter.
     """
-    all_records = [r for r in walk(root, options) if r.size >= min_size]
+    rep = reporter or NoOpProgressReporter()
+
+    with rep.walk_phase("Scanning…") as tick:
+        all_records: list[FileRecord] = []
+        for r in walk(root, options):
+            if r.size >= min_size:
+                tick(r)
+                all_records.append(r)
 
     # First pass: group by size — unique-sized files cannot be duplicates.
     by_size: dict[int, list[FileRecord]] = defaultdict(list)
@@ -57,10 +67,16 @@ def find_duplicates(
         for record in records
     ]
 
+    rep.print_filter_summary(total=len(all_records), candidates=len(candidates))
+
     if not candidates:
         return []
 
-    hashed = hash_records(candidates)
+    cb = rep.hash_phase(
+        total_files=len(candidates),
+        total_bytes=sum(r.size for r in candidates),
+    )
+    hashed = hash_records(candidates, on_file_hashed=cb)
 
     # Second pass: group by digest.
     by_hash: dict[str, list[FileRecord]] = defaultdict(list)
@@ -105,6 +121,9 @@ def dupes_cmd(
     ),
     recurse: bool = typer.Option(True, "--recurse/--no-recurse", help="Walk subdirectories."),
     follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks."),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Show per-file hashing progress."
+    ),
     delete_keep: DeleteKeep | None = typer.Option(
         None,
         "--delete-keep",
@@ -127,14 +146,25 @@ def dupes_cmd(
         exclude_patterns=exclude or [],
     )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=_console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Scanning for duplicates…", total=None)
-        groups = find_duplicates(directory, options, min_size)
+    # Progress output is suppressed for JSON format — pipe consumers must not
+    # receive terminal escape sequences mixed into their data stream.
+    use_verbose = verbose and fmt != OutputFormat.json
+    reporter = make_reporter(use_verbose)
+
+    if use_verbose:
+        groups = find_duplicates(directory, options, min_size, reporter)
+        reporter.stop()
+    elif fmt == OutputFormat.json:
+        groups = find_duplicates(directory, options, min_size, reporter)
+    else:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=_console,
+            transient=True,
+        ) as progress:
+            progress.add_task("Scanning for duplicates…", total=None)
+            groups = find_duplicates(directory, options, min_size, reporter)
 
     render_dupes(groups, str(directory), fmt)
 

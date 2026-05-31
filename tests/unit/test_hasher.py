@@ -165,3 +165,68 @@ class TestHashRecords:
         digests = {r.sha256 for r in result}
         assert len(digests) == 1
         assert digests.pop() == expected_sha256(content)
+
+    def test_on_file_hashed_called_once_per_file(self, tmp_path: Path) -> None:
+        files = [tmp_path / f"f{i}.txt" for i in range(5)]
+        for f in files:
+            f.write_bytes(b"content")
+        records = [make_record(f) for f in files]
+
+        seen: list[object] = []
+        hash_records(records, on_file_hashed=lambda r: seen.append(r))
+
+        assert len(seen) == 5
+
+    def test_on_file_hashed_receives_populated_sha256(self, tmp_path: Path) -> None:
+        f = tmp_path / "f.txt"
+        f.write_bytes(b"hello")
+        records = [make_record(f)]
+
+        received: list[object] = []
+        hash_records(records, on_file_hashed=lambda r: received.append(r))
+
+        assert len(received) == 1
+        from fcompare.engine.models import FileRecord
+        record = received[0]
+        assert isinstance(record, FileRecord)
+        assert len(record.sha256) == 64
+        assert record.sha256 == expected_sha256(b"hello")
+
+    def test_on_file_hashed_not_called_for_skipped_files(self, tmp_path: Path) -> None:
+        good = tmp_path / "good.txt"
+        good.write_bytes(b"ok")
+
+        import fcompare.engine.hasher as hasher_mod
+        original_hash_file = hasher_mod.hash_file
+
+        def patched(path: Path) -> str:
+            if path.name == "bad.txt":
+                raise OSError("unreadable")
+            return original_hash_file(path)
+
+        bad = tmp_path / "bad.txt"
+        bad.write_bytes(b"x")
+
+        hasher_mod.hash_file = patched
+        try:
+            seen_paths: list[object] = []
+            import warnings
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                hash_records(
+                    [make_record(good), make_record(bad)],
+                    on_file_hashed=lambda r: seen_paths.append(r.path),
+                )
+        finally:
+            hasher_mod.hash_file = original_hash_file
+
+        assert good in seen_paths
+        assert bad not in seen_paths
+
+    def test_none_callback_is_ignored(self, tmp_path: Path) -> None:
+        f = tmp_path / "f.txt"
+        f.write_bytes(b"x")
+        records = [make_record(f)]
+        # Must not raise when callback is None (the default).
+        result = hash_records(records, on_file_hashed=None)
+        assert len(result) == 1
