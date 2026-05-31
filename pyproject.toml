@@ -1,17 +1,36 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "fcompare"
 version = "0.1.0"
 description = "macOS file comparison and duplicate detection utility"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+authors = [{ name = "Chad Hanson", email = "chad.j.hanson@gmail.com" }]
+keywords = ["file", "comparison", "duplicates", "sha256", "macos"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Filesystems",
+    "Topic :: Utilities",
+]
 dependencies = [
     "typer~=0.12",
     "rich~=13.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/chanson/fcompare"
 
 [project.scripts]
 fcompare = "fcompare.cli:app"
@@ -33,6 +52,10 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# typer.Argument/Option in defaults is the standard Typer CLI pattern.
+"src/fcompare/commands/*.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.11"

@@ -3,6 +3,8 @@
 import typer
 
 from fcompare import __version__
+from fcompare.commands.diff import diff_cmd
+from fcompare.commands.dupes import dupes_cmd
 
 app = typer.Typer(
     name="fcompare",
@@ -30,3 +32,7 @@ def main(
     ),
 ) -> None:
     """File comparison and duplicate detection for macOS."""
+
+
+app.command("diff")(diff_cmd)
+app.command("dupes")(dupes_cmd)
