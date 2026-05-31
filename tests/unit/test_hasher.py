@@ -3,10 +3,16 @@
 import hashlib
 import warnings
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from fcompare.engine.hasher import CHUNK_SIZE, hash_file, hash_records
+from fcompare.engine.hasher import (
+    _NETWORK_WORKER_COUNT,
+    CHUNK_SIZE,
+    hash_file,
+    hash_records,
+)
 from fcompare.engine.models import FileRecord
 
 
@@ -230,3 +236,79 @@ class TestHashRecords:
         # Must not raise when callback is None (the default).
         result = hash_records(records, on_file_hashed=None)
         assert len(result) == 1
+
+    def test_uses_cpu_count_workers_for_local_fs(self, tmp_path: Path) -> None:
+        import os
+
+        files = [tmp_path / f"f{i}.txt" for i in range(3)]
+        for f in files:
+            f.write_bytes(b"x")
+        records = [make_record(f) for f in files]
+
+        captured_workers: list[int] = []
+
+        original_executor = __import__(
+            "concurrent.futures", fromlist=["ThreadPoolExecutor"]
+        ).ThreadPoolExecutor
+
+        class CapturingExecutor(original_executor):  # type: ignore[misc]
+            def __init__(self, max_workers: int | None = None, **kw: object) -> None:
+                captured_workers.append(max_workers or 0)
+                super().__init__(max_workers=max_workers, **kw)
+
+        with patch("fcompare.engine.hasher.is_network_fs", return_value=False), \
+             patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor):
+            hash_records(records)
+
+        assert captured_workers[0] == (os.cpu_count() or 1)
+
+    def test_uses_network_worker_count_for_smbfs(self, tmp_path: Path) -> None:
+        files = [tmp_path / f"f{i}.txt" for i in range(5)]
+        for f in files:
+            f.write_bytes(b"x")
+        records = [make_record(f) for f in files]
+
+        captured_workers: list[int] = []
+
+        original_executor = __import__(
+            "concurrent.futures", fromlist=["ThreadPoolExecutor"]
+        ).ThreadPoolExecutor
+
+        class CapturingExecutor(original_executor):  # type: ignore[misc]
+            def __init__(self, max_workers: int | None = None, **kw: object) -> None:
+                captured_workers.append(max_workers or 0)
+                super().__init__(max_workers=max_workers, **kw)
+
+        with patch("fcompare.engine.hasher.is_network_fs", return_value=True), \
+             patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor):
+            hash_records(records)
+
+        assert len(captured_workers) == 1
+        assert captured_workers[0] == min(len(records), _NETWORK_WORKER_COUNT)
+
+    def test_network_worker_count_capped_at_record_count(self, tmp_path: Path) -> None:
+        # Fewer records than _NETWORK_WORKER_COUNT — should not spin up idle threads.
+        files = [tmp_path / f"f{i}.txt" for i in range(3)]
+        for f in files:
+            f.write_bytes(b"x")
+        records = [make_record(f) for f in files]
+
+        captured_workers: list[int] = []
+
+        original_executor = __import__(
+            "concurrent.futures", fromlist=["ThreadPoolExecutor"]
+        ).ThreadPoolExecutor
+
+        class CapturingExecutor(original_executor):  # type: ignore[misc]
+            def __init__(self, max_workers: int | None = None, **kw: object) -> None:
+                captured_workers.append(max_workers or 0)
+                super().__init__(max_workers=max_workers, **kw)
+
+        with patch("fcompare.engine.hasher.is_network_fs", return_value=True), \
+             patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor):
+            hash_records(records)
+
+        assert captured_workers[0] == 3  # min(3, _NETWORK_WORKER_COUNT)
+
+    def test_chunk_size_is_1mb(self) -> None:
+        assert CHUNK_SIZE == 1 * 1024 * 1024

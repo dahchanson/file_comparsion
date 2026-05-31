@@ -77,3 +77,4 @@ addopts = "--tb=short"
 
 [tool.coverage.run]
 source_pkgs = ["fcompare"]
+omit = ["*/commands/benchmark.py"]

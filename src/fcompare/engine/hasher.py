@@ -8,10 +8,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
+from fcompare.engine.fs_info import is_network_fs
 from fcompare.engine.models import FileRecord
 
-# 64 KB balances syscall overhead against memory pressure for large files.
-CHUNK_SIZE: int = 65536
+# 1 MB — optimal for NVMe on Apple Silicon; reduces syscall overhead vs 64 KB.
+CHUNK_SIZE: int = 1 * 1024 * 1024
+
+# Network-mounted filesystems are latency-bound rather than compute-bound.
+# More concurrent workers hide per-operation round-trip time and saturate
+# the link. Capped to avoid overwhelming SMB servers with connection limits.
+_NETWORK_WORKER_COUNT: int = 32
 
 
 def hash_file(path: Path) -> str:
@@ -38,9 +44,14 @@ def hash_records(
     workers run in true parallel on multi-core machines. Records whose files
     cannot be read are skipped with a warning and omitted from the result.
 
+    Thread count adapts to filesystem type: network-mounted paths (SMBfs, NFS,
+    AFP) use _NETWORK_WORKER_COUNT threads to hide round-trip latency; local
+    paths use os.cpu_count().
+
     Args:
         records: FileRecords to hash. Each must have a valid ``path``.
-        max_workers: Thread pool size. Defaults to os.cpu_count().
+        max_workers: Override automatic thread count selection. Defaults to
+            auto-detect based on filesystem type.
         on_file_hashed: Optional callback invoked on the calling thread after
             each file completes hashing. Receives the populated FileRecord.
             Use this to drive progress bars without polling.
@@ -51,10 +62,16 @@ def hash_records(
     if not records:
         return []
 
-    workers = max_workers if max_workers is not None else os.cpu_count()
+    if max_workers is None:
+        if is_network_fs(records[0].path):
+            # Cap to number of records so we don't spin up idle threads.
+            max_workers = min(len(records), _NETWORK_WORKER_COUNT)
+        else:
+            max_workers = os.cpu_count()
+
     hashed: list[FileRecord] = []
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_to_record = {pool.submit(hash_file, r.path): r for r in records}
 
         for future in as_completed(future_to_record):

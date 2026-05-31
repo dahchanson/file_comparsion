@@ -22,8 +22,9 @@ class WalkOptions:
 def walk(root: Path, options: WalkOptions | None = None) -> Iterator[FileRecord]:
     """Yield a FileRecord for every file under ``root`` that passes all filters.
 
-    Files that raise PermissionError are skipped with a warning. Directories
-    are never yielded — only regular files (or symlinks to files when
+    Files that raise OSError (including PermissionError, network timeouts, and
+    disconnected SMBfs mounts) are skipped with a warning. Directories are
+    never yielded — only regular files (or symlinks to files when
     follow_symlinks is True).
 
     Args:
@@ -45,8 +46,8 @@ def walk(root: Path, options: WalkOptions | None = None) -> Iterator[FileRecord]
         try:
             if not entry.is_file():
                 continue
-        except PermissionError:
-            warnings.warn(f"Permission denied, skipping: {entry}", stacklevel=2)
+        except OSError:
+            warnings.warn(f"Cannot access, skipping: {entry}", stacklevel=2)
             continue
 
         # Skip hidden files/directories (any path component starting with ".").
@@ -59,8 +60,8 @@ def walk(root: Path, options: WalkOptions | None = None) -> Iterator[FileRecord]
 
         try:
             stat = entry.stat(follow_symlinks=options.follow_symlinks)
-        except PermissionError:
-            warnings.warn(f"Permission denied reading stat, skipping: {entry}", stacklevel=2)
+        except OSError:
+            warnings.warn(f"Cannot stat, skipping: {entry}", stacklevel=2)
             continue
 
         yield FileRecord(
