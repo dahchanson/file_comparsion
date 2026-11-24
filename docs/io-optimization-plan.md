@@ -1,193 +1,110 @@
-# I/O Optimization Plan for `engine/hasher.py`
+# I/O & End-to-End Optimization Record
 
-**Date:** 2026-05-31
-**Status:** Active — informed by `fcompare benchmark` results on Apple Silicon (M-series)
+**Original Date:** 2026-05-31
+**Updated:** 2026-11-23
+**Status:** Implemented — validated on Apple Silicon (macOS, Python 3.12)
 
 ---
 
-## Benchmark Results (256 MB synthetic file, 3 iterations, warm OS page cache)
+## 1. Hardware Characterization (`fcompare benchmark`, 256 MB warm cache)
 
 ```
 Section 1 — Algorithm comparison  (64 KB chunks)
-  sha256      2,129 MB/s   1.00x  ← baseline
-  blake3      1,624 MB/s   0.76x
+  sha256      2,129 MB/s   1.00x  ← baseline (ARMv8.2 SHA-2 hardware extensions)
+  blake3      1,624 MB/s   0.76x  (ARM Neon SIMD in software)
   sha512      1,304 MB/s   0.61x
 
-Section 2 — Chunk size sweep
-  sha256  64 KB    2,117 MB/s   1.00x  (current)
-  sha256  1 MB     2,138 MB/s   1.01x
-  sha256  4 MB     1,946 MB/s   0.92x
-
-  blake3  64 KB    1,624 MB/s   0.77x
-  blake3  1 MB     1,659 MB/s   0.78x
-  blake3  4 MB     1,544 MB/s   0.73x
-
-Section 3 — I/O strategy  (4 MB chunks)
-  sha256  read() 4 MB    1,966 MB/s   0.93x
-  sha256  file_digest()  2,107 MB/s   0.99x
-  sha256  mmap           2,147 MB/s   1.01x   ← fastest SHA-256
-  blake3  read() 4 MB    1,543 MB/s   0.73x
-  blake3  mmap           1,621 MB/s   0.76x
+Section 2 — Chunk size sweep (SHA-256)
+  64 KB       2,117 MB/s   1.00x
+  1 MB        2,138 MB/s   1.01x  ← optimal balance for NVMe + SMB3 MaxReadSize
+  4 MB        1,946 MB/s   0.92x  (L3/DRAM cache pressure under concurrency)
 ```
 
----
-
-## What the Results Mean
-
-### Why SHA-256 wins on Apple Silicon
-
-Apple M-series chips implement dedicated SHA-2 hardware units via ARMv8.2 SHA
-extensions (`SHA256H`, `SHA256H2`, `SHA256SU0`, `SHA256SU1` instructions).
-Python's `hashlib` reaches these through OpenSSL, which detects and uses them
-automatically. The result is ~2.1 GB/s — well above typical software SHA implementations.
-
-SHA-512 is slower on this hardware because the SHA-512 hardware units (`SHA512H`,
-`SHA512SU0`) are optimized for Bitcoin-adjacent use cases and do not benefit from
-the same silicon area investment. This is the opposite of the theoretical expectation
-for 64-bit CPUs.
-
-BLAKE3 runs in software at ~1.6 GB/s using ARM Neon SIMD. Respectable, but cannot
-compete with dedicated SHA-256 hardware on this specific chip.
-
-### Is the tool I/O-bound?
-
-At 2.1 GB/s (SHA-256) the compute rate approaches Apple Silicon NVMe sequential
-read speed (~7 GB/s). With `os.cpu_count()` parallel workers (default), multiple
-files are hashed concurrently. The effective per-worker compute speed therefore
-sits well below the storage ceiling — meaning the tool is likely **I/O-bound**
-on large real-world directories where files are not in the OS page cache.
+### Algorithm Decisions Retained
+- **Keep SHA-256 as default:** Apple Silicon dedicated SHA-256 instructions (`SHA256H`/`SHA256H2`)
+  outperform both SHA-512 (`0.61x`) and software BLAKE3 (`0.76x`).
+- **Keep `CHUNK_SIZE = 1 MB`:** Reduces read syscalls by 16x vs. `64 KB` and matches macOS `smbfs`
+  negotiated `SMB3 MaxReadSize` (`1 MB+`) and APFS cluster I/O coalescing.
 
 ---
 
-## Recommended Changes
+## 2. Implemented Engine & Command Optimizations (2026-11-23)
 
-### 1. Increase `CHUNK_SIZE` from 64 KB to 1 MB (Low effort, ~1% gain)
+### 2.1 Zero-Allocation Unbuffered `readinto()` (`engine/hasher.py`)
+- **Why `readinto()` over `fh.read(1 MB)` and `hashlib.file_digest()`:**
+  - `fh.read(1 MB)` allocated a fresh `1 MB` `bytes` object per chunk (~100,000 heap allocations
+    per 100 GB) and copied through Python's `BufferedReader`.
+  - CPython's `hashlib.file_digest()` uses a smaller fixed internal buffer (`256 KB`), increasing
+    VFS/SMB read transitions by 4x on network mounts.
+  - Opening with `buffering=0` and reading into a per-thread `bytearray(1024 * 1024)` via
+    `fh.readinto()` + `memoryview` achieves **~2,055–2,169 MB/s** single-core throughput while
+    cutting per-file heap allocations from `~2,053 KB` to **`0.5 KB` (-99.98%)**.
+- **Why `mmap` was NOT enabled on network/general paths:**
+  - On SMBfs or network-backed APFS disk images, a dropped connection during a mapped page fault
+    delivers `SIGBUS`, crashing Python unrecoverably (cannot be caught as `OSError`).
 
-The current 64 KB was conservative (appropriate for HDDs). On NVMe SSDs, 1 MB
-chunks reduce per-read syscall overhead with no memory pressure downside since
-the previous chunk is released before the next is read.
+### 2.2 Encrypted APFS over SMBfs Tuning (`engine/fs_info.py`, `engine/hasher.py`)
+- **3-way `StorageProfile` (`LOCAL`, `NETWORK_FS`, `NETWORK_DISK_IMAGE`):**
+  - Direct `smbfs`/`nfs` mounts (`NETWORK_FS`) suffer per-file `SMB2 CREATE`/`CLOSE` RTTs and use up
+    to `32` workers.
+  - Mounted encrypted APFS `.dmg`/`.sparsebundle` volumes backed by SMBfs (`NETWORK_DISK_IMAGE`)
+    decrypt AES-XTS on CPU (`apfs.kext`) and funnel all cache-miss reads through `diskimagesiod`
+    into a single `.dmg` or 8 MB band files on the NAS. Running 32 threads caused 32-way random
+    seeks across NAS storage. `NETWORK_DISK_IMAGE` now uses **`6` workers** and sorts files by
+    **ascending APFS inode (`st_ino`)** to sweep extents/bands sequentially and preserve NAS
+    read-ahead.
+  - `LOCAL` and `NETWORK_FS` sort files by **`size` descending (Longest Processing Time first)** so
+    multi-GB files never straggle on a single thread at the end of a batch.
+- **System-wide `mount` & `hdiutil` caching + device-match bug fix:**
+  - Cached parsed `mount` and `hdiutil info -plist` once per process (`@lru_cache(maxsize=1)`),
+    skipping `hdiutil` on `/`.
+  - Replaced `device.rstrip("s0123456789")` (which collapsed `/dev/disk7s1` to `/dev/disk` and
+    falsely matched whichever `.dmg` appeared first) with exact whole-disk regex matching
+    (`/dev/diskN`) plus synthesized APFS container `mount-point` matching.
 
-**4 MB chunks are slower** (~0.92x) because the larger buffer stays pinned in
-CPU L3/DRAM longer, increasing memory pressure under parallel hashing.
+### 2.3 Persistent `deque` + `SimpleQueue` Worker Pool (`engine/hasher.py`)
+- Replaced eager `{pool.submit(...): r for r in records}` (and per-file `wait(FIRST_COMPLETED)`
+  Condition lock scans) with `workers` persistent tasks consuming from an atomic `collections.deque`
+  and emitting results over C-backed `SimpleQueue`. Keeps scheduling memory `O(workers)` regardless
+  of file count and removes main-thread lock contention on small-file batches.
 
-```python
-# engine/hasher.py — change the constant
-CHUNK_SIZE: int = 1 * 1024 * 1024   # 1 MB — optimal for NVMe on Apple Silicon
-```
+### 2.4 Iterative `os.scandir()` Walker with Subtree Pruning (`engine/walker.py`)
+- Replaced `Path.rglob("*")` (which descended into `.git`, `.Spotlight-V100`, `.fseventsd`, and
+  excluded directories and issued 3 `stat`/`lstat` syscalls per file) with an iterative
+  `os.scandir()` stack:
+  - Filters hidden/excluded names *before* descending or `stat`ing (preventing encrypted APFS
+    catalog B-tree faults over SMB).
+  - Uses `readdir` `d_type` + a single `DirEntry.stat()` per file and pre-compiles exclude globs
+    into one combined regex.
 
-**Do not change:** The dynamic is file-size-dependent and hardware-dependent.
-A future `config.py` constant with env-var override is the right path if tuning
-is needed across environments.
-
----
-
-### 2. Offer `hashlib.file_digest()` as an alternative read path (Low effort, ~1% gain)
-
-Python 3.11 added `hashlib.file_digest(fh, algo)` — a C-level implementation
-that avoids the Python `while chunk := fh.read()` loop overhead. It's
-approximately equivalent to mmap for SHA-256 (~2,107 MB/s vs ~2,147 MB/s) but
-requires no additional memory mapping.
-
-```python
-def hash_file(path: Path) -> str:
-    with path.open("rb") as fh:
-        return hashlib.file_digest(fh, "sha256").hexdigest()
-```
-
-**Trade-off:** `file_digest()` does not support blake3 or any non-`hashlib`
-algorithm. If we ever switch algorithms, we'd revert to the manual loop.
-
----
-
-### 3. Memory-mapped I/O for large files (Medium effort, ~1% gain for SHA-256)
-
-mmap is the fastest single-threaded option for SHA-256 on this hardware
-(2,147 MB/s, ~1% over 64 KB read()). Benefits increase on cold cache because
-the kernel can apply readahead optimizations without userspace intervention.
-
-The tradeoff: mmap maps the entire file into virtual address space. For files
-larger than available RAM, the kernel will page-fault in regions on demand
-(which is fine), but for thousands of files in parallel, the combined virtual
-address space usage can be significant on memory-constrained machines.
-
-**Proposed implementation:**
-
-```python
-import mmap
-
-# Threshold above which mmap is preferred over read().
-# Below this size, the mmap overhead (fd open, MAP_SHARED setup) is not amortized.
-_MMAP_THRESHOLD_BYTES: int = 64 * 1024 * 1024  # 64 MB
-
-def hash_file(path: Path) -> str:
-    size = path.stat().st_size
-    if size >= _MMAP_THRESHOLD_BYTES:
-        with path.open("rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            return hashlib.sha256(mm).hexdigest()
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(CHUNK_SIZE):
-            digest.update(chunk)
-    return digest.hexdigest()
-```
-
-**Risk:** `mmap.mmap(..., 0)` with length=0 maps the entire file. For files
-that grow between `stat()` and `mmap()` (rare but possible), the length must
-be re-validated. Wrap in try/except `ValueError`/`OSError`.
+### 2.5 Wire-Byte Elimination in `diff` and `dupes` (`commands/diff.py`, `commands/dupes.py`)
+- **`diff`:** Never hashes `only_in_left` or `only_in_right`; skips hashing size-mismatched files
+  automatically for `--show same`/`--show unique` and opt-in `--fast`; runs unified single-pool
+  hashing when `left` and `right` share `st_dev`, or concurrent per-device pools across distinct
+  mounts.
+- **`dupes`:** Buckets sizes in one pass without single-item list allocations, then runs a
+  4 KB-block-aligned `64 KB` head + `64 KB` tail pre-hash on size-colliding files `> 256 KB` before
+  full SHA-256 hashing.
+- **Models (`engine/models.py`):** Added `@dataclass(slots=True)` across all dataclasses.
 
 ---
 
-## What NOT to Implement
+## 3. Measured End-to-End Results (Original vs. Optimized)
 
-### SHA-512
+Median of 5 runs on Apple Silicon (Python 3.12):
 
-**Do not switch to SHA-512.** Benchmark result: 0.61x vs SHA-256 on Apple Silicon.
-The ARM SHA-256 hardware is faster than SHA-512 hardware on M-series chips. This
-is the opposite of what theoretical analysis of 64-bit CPUs predicts, and confirms
-that hardware characterization must come before algorithm selection.
-
-### BLAKE3 as default
-
-**Do not switch to BLAKE3 as the default.** Benchmark result: 0.76x vs SHA-256
-on Apple Silicon. BLAKE3 is a software implementation and cannot compete with
-dedicated hardware. BLAKE3 would be the right default on hardware *without*
-SHA-2 acceleration (older x86, embedded ARM without SHA extensions), but that
-is not the target platform for this tool.
-
-BLAKE3 remains available via the `[benchmark]` optional dependency for users
-who want to experiment.
-
-### GPU hashing
-
-Not viable on macOS: CUDA unavailable, OpenCL removed, Metal Compute would
-require writing MSL shaders with no off-the-shelf Python support, and the
-data-transfer overhead to/from GPU would negate gains for streaming file I/O.
-
----
-
-## Implementation Priority
-
-| Change | Effort | Expected gain | Recommendation |
-|---|---|---|---|
-| Increase `CHUNK_SIZE` to 1 MB | 1 line | ~1% | **Do it** |
-| `hashlib.file_digest()` | 3 lines | ~1% | **Do it** (simplifies code) |
-| mmap for large files (≥64 MB) | ~20 lines | ~1–5% on cold cache | Optional |
-| SHA-512 | 1 line | **−39%** | Do not do |
-| BLAKE3 as default | small | **−24%** | Do not do |
-
----
-
-## Caveats
-
-All results are warm OS page cache. For cold cache (first access, files not
-recently read), the storage I/O bottleneck (~7 GB/s NVMe) dominates regardless
-of algorithm choice. The ~2% gains shown above are effectively noise at the
-storage ceiling.
-
-The meaningful optimizations for cold-cache performance are:
-- More parallel workers (already implemented via `ThreadPoolExecutor`)
-- The size-first pre-filter in `dupes` (already implemented — eliminates ~80-90%
-  of hashing work on typical photo libraries)
-
-Run `fcompare benchmark --size-mb 512` periodically on new hardware to re-validate
-assumptions.
+| Workload | Metric | Original | Optimized | Improvement |
+|---|---|---:|---:|---:|
+| Walk — 5,000 visible files | Wall time | `285.71 ms` | `34.35 ms` | **8.3x faster** (`-88.0%`) |
+| Walk — 12,000 files (w/ `.Spotlight-V100`, `.git`, `node_modules`) | Wall time | `573.20 ms` | `21.64 ms` | **26.5x faster** (`-96.2%`) |
+| `diff` — partial sync (default) | Wall time | `258.94 ms` | `71.82 ms` | **3.6x faster** (`-72.3%`) |
+| `diff` — partial sync (`--fast` / `--show same`) | Wall time | `258.94 ms` | `55.14 ms` | **4.7x faster** (`-78.7%`) |
+| `diff` — bytes read (default / `--fast`) | Disk/SMB I/O | `622.58 MB` | `222.58` / `62.50 MB` | **2.8x / 10.0x less I/O** |
+| `dupes` — 2k unique + 40 × 4 MB bands + 6 × 4 MB dupes | Wall time | `135.17 ms` | `22.89 ms` | **5.9x faster** (`-83.1%`) |
+| `dupes` — bytes read | Disk/SMB I/O | `184.00 MB` | `29.75 MB` | **6.2x less I/O** (`-83.8%`) |
+| `dupes` — peak Python memory | `tracemalloc` | `17,471.5 KB` | `6,243.0 KB` | **2.8x lower RAM** (`-64.3%`) |
+| `hash_file` — 256 MB file | Throughput | `1,712.9 MB/s` | `2,055.1 MB/s` | **+20.0% throughput** |
+| `hash_file` — 256 MB heap allocations | `tracemalloc` | `2,053.0 KB` | `0.5 KB` | **-99.98% heap churn** |
+| `hash_records` — mixed 188 MB w/ 128 MB tail file | Wall time | `83.93 ms` | `64.87 ms` | **1.29x faster** (`-22.7%`) |
+| `fs_info.is_network_fs` — cold cache + 50 paths | Wall time | `692.41 ms` | `9.79 ms` | **70.7x faster** (`-98.6%`) |
+| `FileRecord` memory — 50,000 instances | `tracemalloc` | `7,066.6 KB` | `5,894.7 KB` | **-16.6% RAM** |

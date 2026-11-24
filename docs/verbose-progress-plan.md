@@ -1,305 +1,79 @@
-# Verbose Progress Reporting — Design & Implementation Plan
+# Verbose Progress Reporting — Design & Implementation Notes
 
-**Date:** 2026-05-31
-**Status:** Active
+**Original Date:** 2026-05-31
+**Updated:** 2026-11-23
+**Status:** Implemented
 **Depends on:** design.md, implementation-plan.md
 
 ---
 
-## Problem
+## Problem & Goal
 
-Both `diff` and `dupes` display a non-updating spinner during the hash phase.
-For large directories (tens of thousands of files, multi-GB photo libraries) this looks
-identical to a hang for minutes at a time. The user has no visibility into:
+Without `--verbose`, `diff` and `dupes` show an indeterminate spinner while hashing. On multi-GB
+photo libraries or SMB-mounted APFS archives, users need live visibility into discovered file
+counts, size/pre-hash filter reduction, hashing throughput (MB/s), and byte-accurate ETA.
 
-- How many files were found
-- How many have been hashed vs. remain
-- Current throughput
-- Estimated time remaining
+Adding `--verbose` / `-v` replaces the transient spinner with a multi-phase Rich progress display on
+`stderr` while keeping default and `--format json` behavior clean for scripting.
 
 ---
 
-## Goal
-
-Add a `--verbose` / `-v` flag to both commands that replaces the silent spinner with
-a multi-phase Rich progress display. Default (non-verbose) behaviour is unchanged.
-
----
-
-## Proposed Output
+## Output Format
 
 ### `fcompare diff --verbose`
 
 ```
-  Scanning left…          3,241 files
-  Scanning right…         3,198 files
-  Hashing 6,439 files  ━━━━━━━━━━━━━━━━━━━  62%  3,989/6,439  14.2 MB/s  eta 0:00:18
+  Scanning left…   3,241 files ━━━━━━━━━━━━━━━━━━━━━━━━━
+  Scanning right…  3,198 files ━━━━━━━━━━━━━━━━━━━━━━━━━
+  Hashing 6,120 files ━━━━━━━━━━━━━━╺━━━━━━ 3,989/6,120  112.4 MB/s  0:00:18  0:00:31
 ```
+
+*(Note: `Hashing` count reflects only shared files requiring SHA-256 verification; unique files and
+`--fast` size-mismatched files are classified without hashing.)*
 
 ### `fcompare dupes --verbose`
 
 ```
-  Scanning…               18,432 files found
-  Size filter…            1,204 candidates  (17,228 skipped — unique size)
-  Hashing 1,204 files  ━━━━━━━━━━━━━━━━━━━  88%  1,059/1,204   8.6 MB/s  eta 0:00:04
+  Scanning…  18,432 files ━━━━━━━━━━━━━━━━━━━━━━━━━
+  Size filter:  1,204 candidates  (17,228 skipped — unique size)
+  Hashing 312 files ━━━━━━━━━━━━━━━━━━╺━━ 274/312  98.6 MB/s  0:00:04  0:00:29
 ```
 
----
-
-## Architecture
-
-### Root cause
-
-`hash_records()` runs all hashing in a `ThreadPoolExecutor` and only returns after
-all futures complete. The caller has no window to update a progress bar between files.
-
-The fix: add an optional `on_file_hashed` callback to `hash_records()`. It is called
-from the `as_completed` loop — one call per file, on the main thread, after the worker
-thread finishes. This keeps the engine layer free of Rich/display dependencies while
-giving the display layer a hook for per-file updates.
-
-### New module: `display/progress.py`
-
-A `ProgressReporter` class that owns a Rich `Progress` instance and exposes the
-phase transitions that both commands need:
-
-```
-ProgressReporter
-  .walk_phase(label: str) -> context manager
-      Shows a spinner + live file count ticking up as files are discovered.
-      Caller wraps walk() with this and feeds it each FileRecord.
-
-  .hash_phase(total_files: int, total_bytes: int) -> on_file_hashed callback
-      Creates a bounded progress bar with file count, MB/s, ETA.
-      Returns a callable to pass into hash_records(on_file_hashed=...).
-
-  .print_filter_summary(total: int, candidates: int) -> None
-      Prints "N candidates (M skipped)" for the dupes size-filter step.
-```
-
-When `verbose=False`, `ProgressReporter` is replaced by a no-op stub that satisfies
-the same interface — so the command logic branches only once (at the flag check), not
-at every display call.
+*(Note: when size-colliding files exceed `256 KB`, the 128 KB head+tail pre-hash further narrows
+candidates before the full `Hashing` phase begins.)*
 
 ---
 
-## Detailed Changes
+## Implemented Architecture (`display/progress.py`)
 
-### 1. `engine/hasher.py`
+### Engine decoupling
+`hash_records()` accepts `on_file_hashed: Callable[[FileRecord], None] | None = None`, invoked on
+the main thread as worker threads push completed digests onto the result `SimpleQueue` (with a
+thread lock when `diff` runs two device pools concurrently). `engine/` has zero dependency on
+`rich` or `display/`.
 
-Add an optional callback to `hash_records()`:
+### `ProgressReporter` & `NoOpProgressReporter`
+Both expose identical methods instantiated via `make_reporter(use_verbose)`:
+- `walk_phase(label: str) -> ContextManager[Callable[[FileRecord], None]]`
+- `hash_phase(total_files: int, total_bytes: int) -> Callable[[FileRecord], None]`
+- `print_filter_summary(total: int, candidates: int) -> None`
+- `stop() -> None`
 
-```python
-from collections.abc import Callable
+### Production Refinements (2026-11-23)
 
-def hash_records(
-    records: list[FileRecord],
-    max_workers: int | None = None,
-    on_file_hashed: Callable[[FileRecord], None] | None = None,
-) -> list[FileRecord]:
-    ...
-    for future in as_completed(future_to_record):
-        record = future_to_record[future]
-        try:
-            digest = future.result()
-        except OSError as exc:
-            warnings.warn(...)
-            continue
-        hashed_record = replace(record, sha256=digest)
-        hashed.append(hashed_record)
-        if on_file_hashed is not None:
-            on_file_hashed(hashed_record)   # ← new
-```
-
-**Backward compatible** — default is `None`, existing callers unchanged.
-
----
-
-### 2. `display/progress.py` (new file)
-
-```python
-class ProgressReporter:
-    """Manages Rich progress display for multi-phase hashing operations."""
-
-    def walk_phase(self, label: str) -> AbstractContextManager[Callable[[FileRecord], None]]:
-        """Context manager; yields a tick() callable to call per discovered file."""
-        ...
-
-    def hash_phase(
-        self, total_files: int, total_bytes: int
-    ) -> Callable[[FileRecord], None]:
-        """Returns an on_file_hashed callback for hash_records()."""
-        ...
-
-    def print_filter_summary(self, total: int, candidates: int) -> None:
-        """Print the size-filter reduction line (dupes only)."""
-        ...
-
-    def stop(self) -> None:
-        """Finalize and clear progress display."""
-        ...
-
-
-class NoOpProgressReporter:
-    """Drop-in no-op used when --verbose is not set."""
-
-    def walk_phase(self, label: str) -> AbstractContextManager[...]:
-        ...   # yields a no-op tick
-
-    def hash_phase(self, total_files: int, total_bytes: int) -> Callable[...]:
-        return lambda r: None
-
-    def print_filter_summary(self, total: int, candidates: int) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-```
-
-**Rich Progress columns for hash phase:**
-
-| Column | Type | Notes |
-|---|---|---|
-| `SpinnerColumn` | animated | always on |
-| `TextColumn` | description | "Hashing N files…" |
-| `BarColumn` | progress bar | bounded when total known |
-| `TaskProgressColumn` | `{done}/{total}` | file counts |
-| `TransferSpeedColumn` | MB/s | uses `completed` = bytes hashed |
-| `TimeRemainingColumn` | ETA | requires bounded total |
-
-The `advance()` call passes `bytes_hashed = record.size` as `completed` delta so
-`TransferSpeedColumn` and `TimeRemainingColumn` work correctly (speed in bytes/s,
-ETA based on remaining bytes).
-
----
-
-### 3. `commands/diff.py`
-
-Add `--verbose / -v` flag. Thread into `compare_directories()`:
-
-```python
-def compare_directories(
-    left: Path,
-    right: Path,
-    options: WalkOptions,
-    reporter: ProgressReporter | NoOpProgressReporter | None = None,
-) -> DiffResult:
-    rep = reporter or NoOpProgressReporter()
-
-    with rep.walk_phase(f"Scanning {left.name}…") as tick:
-        left_records = [r for r in walk(left, options) if not tick(r) or True]
-
-    with rep.walk_phase(f"Scanning {right.name}…") as tick:
-        right_records = [r for r in walk(right, options) if not tick(r) or True]
-
-    cb = rep.hash_phase(
-        total_files=len(left_records) + len(right_records),
-        total_bytes=sum(r.size for r in left_records + right_records),
-    )
-    left_hashed = hash_records(left_records, on_file_hashed=cb)
-    right_hashed = hash_records(right_records, on_file_hashed=cb)
-    ...
-```
-
-In `diff_cmd`, construct `ProgressReporter()` or `NoOpProgressReporter()` based on
-the `--verbose` flag and pass it in. The existing transient spinner is removed when
-`verbose=True` (the ProgressReporter owns the display).
-
----
-
-### 4. `commands/dupes.py`
-
-Add `--verbose / -v` flag. Thread into `find_duplicates()`:
-
-```python
-def find_duplicates(
-    root: Path,
-    options: WalkOptions,
-    min_size: int = 1,
-    reporter: ProgressReporter | NoOpProgressReporter | None = None,
-) -> list[DupeGroup]:
-    rep = reporter or NoOpProgressReporter()
-
-    with rep.walk_phase("Scanning…") as tick:
-        all_records = [r for r in walk(root, options) if r.size >= min_size and not tick(r) or True]
-
-    # size-filter step
-    ...build by_size, candidates...
-    rep.print_filter_summary(total=len(all_records), candidates=len(candidates))
-
-    cb = rep.hash_phase(
-        total_files=len(candidates),
-        total_bytes=sum(r.size for r in candidates),
-    )
-    hashed = hash_records(candidates, on_file_hashed=cb)
-    ...
-```
-
----
-
-### 5. `cli.py` — no changes needed
-
-`--verbose` is per-command, not global, because the two commands have different
-phase structures. A global flag would require threading it through the entire call
-chain without meaningful benefit.
-
----
-
-## File Change Summary
-
-| File | Change |
-|---|---|
-| `src/fcompare/engine/hasher.py` | Add `on_file_hashed` callback param |
-| `src/fcompare/display/progress.py` | **New** — `ProgressReporter`, `NoOpProgressReporter` |
-| `src/fcompare/commands/diff.py` | Add `--verbose` flag, `reporter` param on `compare_directories` |
-| `src/fcompare/commands/dupes.py` | Add `--verbose` flag, `reporter` param on `find_duplicates` |
-| `tests/unit/test_hasher.py` | Test callback fires per-file with correct record |
-| `tests/unit/test_progress.py` | **New** — test ProgressReporter phases, NoOpProgressReporter |
-| `tests/integration/test_diff_command.py` | Test `--verbose` flag doesn't break output |
-| `tests/integration/test_dupes_command.py` | Test `--verbose` flag doesn't break output |
-
----
-
-## Implementation Sequence
-
-### Step 1 — `engine/hasher.py` callback (30 min)
-
-Minimal, isolated, backward-compatible. Add the callback and a unit test.
-All existing tests must still pass unchanged.
-
-### Step 2 — `display/progress.py` (1 hr)
-
-Implement `ProgressReporter` and `NoOpProgressReporter`. Unit test both:
-- `ProgressReporter` tick callback advances the task correctly
-- `NoOpProgressReporter` is a silent no-op (never raises, never prints)
-- Both satisfy the same interface
-
-### Step 3 — Wire into `diff` command (45 min)
-
-- Refactor `compare_directories()` to accept `reporter`
-- Add `--verbose` flag to `diff_cmd`
-- Integration test: `--verbose` produces "Scanning" and "Hashing" in stderr;
-  final stdout result is identical to non-verbose run
-
-### Step 4 — Wire into `dupes` command (45 min)
-
-- Refactor `find_duplicates()` to accept `reporter`
-- Add `--verbose` flag to `dupes_cmd`
-- Integration test: filter summary line appears in `--verbose` output;
-  stdout result identical to non-verbose
-
-### Step 5 — Lint, coverage, smoke test (30 min)
-
-- `ruff + mypy` clean
-- Coverage ≥ 90% (target: maintain ~97%)
-- Manual smoke: `fcompare diff ~/large-dir1 ~/large-dir2 --verbose`
-
----
-
-## Design Constraints
-
-- Engine layer (`engine/`) must not import from `display/` — progress is a display concern.
-- `NoOpProgressReporter` must be the default — verbose off by default, no behaviour change.
-- `compare_directories()` and `find_duplicates()` remain unit-testable without a Rich console.
-- Walk phase uses an indeterminate counter (total unknown); hash phase uses a bounded bar (total known before hashing starts).
-- Progress writes to `stderr`; results write to `stdout` — pipe-friendly.
+1. **Batched walk-phase updates (`_WALK_UPDATE_BATCH = 128`):**
+   - Updating Rich task descriptions and acquiring Rich's internal `RLock` on every file created
+     unnecessary overhead on fast `os.scandir()` walks over 100k+ files.
+   - `tick()` increments an integer counter and updates Rich every `128` files, then writes the
+     exact final `total=count, completed=count` in the context manager's `finally` block.
+2. **Accurate file counts alongside byte-weighted speed & ETA:**
+   - Using Rich's built-in `MofNCompleteColumn` with `total=total_bytes` previously rendered raw
+     byte counts (`1048576/2097152`) instead of file counts, and `max(record.size, 1)` overflowed
+     `total_bytes` when 0-byte files were present.
+   - `ProgressReporter` now tracks byte progress on the task (`total=max(total_bytes, 1)`,
+     `advance=record.size`) so `TransferSpeedColumn` and `TimeRemainingColumn` remain byte-accurate,
+     while rendering `{task.fields[counts]}` (`done_files/total_files`) for exact file counts and
+     cleanly completing `total_bytes == 0` batches.
+3. **Thread safety across concurrent `diff` pools:**
+   - When `diff` compares directories across two distinct devices (`left` NVMe + `right` SMB), both
+     walk phases and hash callbacks safely update `ProgressReporter` concurrently.
