@@ -9,6 +9,7 @@ import pytest
 from fcompare.engine.fs_info import (
     LOCAL_FS_TYPES,
     NETWORK_FS_TYPES,
+    StorageProfile,
     _is_disk_image_on_network,
     _is_under,
     _mount_info,
@@ -16,6 +17,7 @@ from fcompare.engine.fs_info import (
     is_local_fs,
     is_mmap_safe,
     is_network_fs,
+    storage_profile,
 )
 
 # ---------------------------------------------------------------------------
@@ -164,10 +166,10 @@ class TestMountInfo:
     def test_real_smbfs_mount_line_format(self, tmp_path: Path) -> None:
         # Exact format from macOS for an SMBfs mount.
         smbfs = (
-            "//chad@nvx._smb._tcp.local/chad-data on /Volumes/chad-data "
-            "(smbfs, nodev, nosuid, mounted by chanson)"
+            "//user@nas._smb._tcp.local/media-share on /Volumes/media-share "
+            "(smbfs, nodev, nosuid, mounted by alice)"
         )
-        target = Path("/Volumes/chad-data/testdir/file.txt")
+        target = Path("/Volumes/media-share/testdir/file.txt")
         output = _local_mount("/", "apfs") + "\n" + smbfs + "\n"
         with patch("fcompare.engine.fs_info.subprocess.run", return_value=_mock_mount(output)):
             _clear_cache()
@@ -394,7 +396,7 @@ class TestIsDiskImageOnNetwork:
             "/dev/disk3s1 on / (apfs, local)\n"
         )
         plist_bytes = self._make_hdiutil_plist(
-            image_path="/Users/chanson/images/archive.dmg",
+            image_path="/Users/alice/images/archive.dmg",
             dev_entry="/dev/disk7",
         )
         hdi_mock = MagicMock()
@@ -415,6 +417,47 @@ class TestIsDiskImageOnNetwork:
             "fcompare.engine.fs_info.subprocess.run", side_effect=OSError("no hdiutil")
         ):
             assert _is_disk_image_on_network(tmp_path) is False
+
+    def test_local_dmg_ahead_of_network_dmg_does_not_shadow_network_dmg(
+        self, tmp_path: Path
+    ) -> None:
+        import plistlib
+
+        mount_output = (
+            f"/dev/disk7s1 on {tmp_path} (apfs, local)\n"
+            "/dev/disk4s1 on /Volumes/LocalImg (apfs, local)\n"
+            "/dev/disk3s1s1 on / (apfs, sealed, local)\n"
+            "//user@nas/media-share on /Volumes/media-share (smbfs, nodev)\n"
+        )
+        plist_bytes = plistlib.dumps(
+            {
+                "images": [
+                    {
+                        "image-path": "/Users/alice/local.dmg",
+                        "system-entities": [{"dev-entry": "/dev/disk4"}],
+                    },
+                    {
+                        "image-path": "/Volumes/media-share/archive.dmg",
+                        "system-entities": [
+                            {"dev-entry": "/dev/disk6"},
+                            {"dev-entry": "/dev/disk7s1", "mount-point": str(tmp_path)},
+                        ],
+                    },
+                ]
+            }
+        )
+        hdi_mock = MagicMock()
+        hdi_mock.returncode = 0
+        hdi_mock.stdout = plist_bytes.decode()
+
+        def _run_side_effect(cmd: list, **kw: object) -> MagicMock:
+            return _mock_mount(mount_output) if cmd[0] == "mount" else hdi_mock
+
+        with patch("fcompare.engine.fs_info.subprocess.run", side_effect=_run_side_effect):
+            assert _is_disk_image_on_network(tmp_path) is True
+            assert storage_profile(tmp_path) == StorageProfile.NETWORK_DISK_IMAGE
+            # Meanwhile a path on "/" must still be classified as LOCAL!
+            assert storage_profile(Path("/Users/alice")) == StorageProfile.LOCAL
 
 
 # ---------------------------------------------------------------------------

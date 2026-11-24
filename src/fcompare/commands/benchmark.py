@@ -24,8 +24,8 @@ except ImportError:
 _console = Console()
 
 _CHUNK_SIZES: dict[str, int] = {
-    "64 KB (current)": 64 * 1024,
-    "1 MB": 1 * 1024 * 1024,
+    "64 KB": 64 * 1024,
+    "1 MB (current)": 1 * 1024 * 1024,
     "4 MB": 4 * 1024 * 1024,
 }
 
@@ -151,7 +151,7 @@ def benchmark_cmd(
         )
 
     algos = ["sha256", "sha512"] + (["blake3"] if HAS_BLAKE3 else [])
-    chunk_64k = _CHUNK_SIZES["64 KB (current)"]
+    chunk_64k = _CHUNK_SIZES["64 KB"]
     chunk_4mb = _CHUNK_SIZES["4 MB"]
 
     _console.print(

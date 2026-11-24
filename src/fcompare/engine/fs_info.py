@@ -1,7 +1,8 @@
 """Filesystem type detection for I/O strategy selection.
 
-Parses macOS ``mount`` output to identify the filesystem type and locality of
-the mount containing a given path. Results are cached per resolved path.
+Parses macOS ``mount`` and ``hdiutil`` output to identify the filesystem type,
+locality, and backing topology of the mount containing a given path. System-wide
+mount and disk-image tables are parsed at most once per process.
 
 Implementation note: macOS ``stat -f "%T"`` returns the *file type* (e.g. ``/``
 for directory) — NOT the filesystem type name. Parsing ``mount`` is the only
@@ -9,191 +10,260 @@ reliable approach without ctypes.
 
 APFS note: macOS does not expose encryption status through mount(8). Both
 encrypted and unencrypted APFS volumes report ``apfs`` as the filesystem type.
-Hardware AES-XTS encryption (T2/Secure Enclave) is transparent; I/O behaviour
-is identical. Locality is determined by the ``local`` flag in mount output:
-  - local APFS (NVMe, USB, Thunderbolt): ``(apfs, local, ...)``   → local
-  - network-backed APFS (iSCSI, etc.):   ``(apfs, ...)`` no local → network
+On internal NVMe, hardware AES-XTS encryption is inline; on attached encrypted
+APFS disk images (``.dmg`` / ``.sparsebundle``), AES-XTS decryption runs on CPU
+via ``apfs.kext`` and all block reads funnel through ``diskimagesiod``.
 """
 
+import plistlib
 import re
 import subprocess
+from dataclasses import dataclass
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
-# Captures mountpoint and full flags string from mount output lines.
+# Captures device, mountpoint, and full flags string from mount output lines.
 # Format:  <device> on </mount/point> (<flags>)
 # Non-greedy /.+? stops at first " (" so mountpoints with spaces work.
-_MOUNT_RE = re.compile(r".+ on (/.*?) \(([^)]+)\)")
+_MOUNT_RE = re.compile(r"^(.+?) on (/.*?) \(([^)]+)\)")
+
+# Extracts the whole-disk node (/dev/diskN) from a slice path (/dev/diskNsMsK).
+_WHOLE_DISK_RE = re.compile(r"^(/dev/disk\d+)(?:s\d+)*$")
 
 # Filesystem type names that indicate network-mounted, latency-bound I/O.
-# Hashing on these requires more concurrent workers to hide round-trip latency.
 NETWORK_FS_TYPES: frozenset[str] = frozenset(
     {"smbfs", "nfs", "afpfs", "cifs", "webdavfs", "ftpfs"}
 )
 
 # Filesystem type names confirmed as local block-device mounts.
-# mmap() is safe and efficient on all of these when the "local" flag is present.
-#
-# "apfs"  — Apple File System, encrypted or unencrypted (both report "apfs").
-#            Only safe for local I/O when mount output includes the "local" flag.
-# "hfs"   — HFS+, legacy macOS volumes and some external drives.
-# "exfat" — Common on FAT-formatted USB/SD drives shared with Windows.
-# "msdos" — FAT32, older external media.
-# "ntfs"  — Read-only NTFS mounts via macOS's built-in driver.
-# "udf"   — Optical discs and some USB drives.
 LOCAL_FS_TYPES: frozenset[str] = frozenset(
     {"apfs", "hfs", "exfat", "msdos", "ntfs", "udf"}
 )
 
 
-@lru_cache(maxsize=64)
-def _mount_info(path: Path) -> tuple[str, bool]:
-    """Return ``(fstype, is_local)`` for the mount containing path.
+class StorageProfile(StrEnum):
+    """I/O execution profile for a target filesystem."""
 
-    ``is_local`` is True when the mount output includes the ``local`` flag,
-    indicating a block-device-backed mount rather than a network mount.
+    LOCAL = "local"
+    NETWORK_FS = "network_fs"
+    NETWORK_DISK_IMAGE = "network_disk_image"
+    UNKNOWN = "unknown"
 
-    Returns ``("unknown", False)`` if the mount cannot be determined.
-    """
+
+@dataclass(frozen=True, slots=True)
+class _MountEntry:
+    mountpoint: str
+    device: str
+    fstype: str
+    is_local: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _DiskImageEntry:
+    image_path: str
+    whole_disks: frozenset[str]
+    mountpoints: frozenset[str]
+
+
+def _whole_disk(dev: str) -> str:
+    """Return ``/dev/diskN`` for a ``/dev/diskNsM`` device path, or ``""``."""
+    m = _WHOLE_DISK_RE.match(dev)
+    return m.group(1) if m else ""
+
+
+@lru_cache(maxsize=1)
+def _parsed_mounts() -> tuple[_MountEntry, ...]:
+    """Parse ``mount`` once and return entries ordered longest-mountpoint first."""
     try:
-        resolved = str(path.resolve())
         result = subprocess.run(
             ["mount"], capture_output=True, text=True, timeout=2
         )
-        best_len = 0
-        best_type = "unknown"
-        best_local = False
+        entries: list[_MountEntry] = []
         for line in result.stdout.splitlines():
             m = _MOUNT_RE.match(line)
             if not m:
                 continue
-            mountpoint = m.group(1)
-            flags = [f.strip().lower() for f in m.group(2).split(",")]
+            device = m.group(1).strip()
+            mountpoint = m.group(2)
+            flags = [f.strip().lower() for f in m.group(3).split(",")]
             fstype = flags[0] if flags else "unknown"
             is_local = "local" in flags
-            if _is_under(resolved, mountpoint) and len(mountpoint) > best_len:
-                best_len = len(mountpoint)
-                best_type = fstype
-                best_local = is_local
-        return best_type, best_local
+            entries.append(
+                _MountEntry(
+                    mountpoint=mountpoint,
+                    device=device,
+                    fstype=fstype,
+                    is_local=is_local,
+                )
+            )
+        entries.sort(key=lambda e: len(e.mountpoint), reverse=True)
+        return tuple(entries)
     except Exception:
-        return "unknown", False
+        return ()
+
+
+@lru_cache(maxsize=1)
+def _parsed_disk_images() -> tuple[_DiskImageEntry, ...]:
+    """Parse ``hdiutil info -plist`` once into attached disk-image descriptors."""
+    try:
+        hdi_result = subprocess.run(
+            ["hdiutil", "info", "-plist"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if hdi_result.returncode != 0:
+            return ()
+        info: dict[str, Any] = plistlib.loads(hdi_result.stdout.encode())
+        out: list[_DiskImageEntry] = []
+        for image in info.get("images", []):
+            image_path = image.get("image-path", "")
+            if not image_path:
+                continue
+            disks: set[str] = set()
+            mounts: set[str] = set()
+            for entity in image.get("system-entities", []):
+                dev = entity.get("dev-entry", "")
+                wd = _whole_disk(dev)
+                if wd:
+                    disks.add(wd)
+                mp = entity.get("mount-point", "")
+                if mp:
+                    mounts.add(mp)
+            if disks or mounts:
+                out.append(
+                    _DiskImageEntry(
+                        image_path=image_path,
+                        whole_disks=frozenset(disks),
+                        mountpoints=frozenset(mounts),
+                    )
+                )
+        return tuple(out)
+    except Exception:
+        return ()
+
+
+def _find_mount_entry(path: Path) -> _MountEntry | None:
+    """Return the most specific ``_MountEntry`` covering ``path``."""
+    try:
+        resolved = str(path.resolve())
+    except Exception:
+        return None
+    for entry in _parsed_mounts():
+        if _is_under(resolved, entry.mountpoint):
+            return entry
+    return None
+
+
+class _MountInfoLookup:
+    """Cached ``(fstype, is_local)`` lookup with unified cache clearing."""
+
+    def __init__(self) -> None:
+        self._dir_cache: dict[Path, tuple[str, bool]] = {}
+
+    def __call__(self, path: Path) -> tuple[str, bool]:
+        cached = self._dir_cache.get(path)
+        if cached is not None:
+            return cached
+        entry = _find_mount_entry(path)
+        res = (entry.fstype, entry.is_local) if entry is not None else ("unknown", False)
+        if len(self._dir_cache) >= 512:
+            self._dir_cache.clear()
+        self._dir_cache[path] = res
+        return res
+
+    def cache_clear(self) -> None:
+        self._dir_cache.clear()
+        _parsed_mounts.cache_clear()
+        _parsed_disk_images.cache_clear()
+        _is_disk_image_on_network.cache_clear()
+
+
+class _DiskImageNetworkLookup:
+    """Cached check for whether ``path`` resides on a network-backed disk image."""
+
+    def __init__(self) -> None:
+        self._cache: dict[Path, bool] = {}
+
+    def __call__(self, path: Path) -> bool:
+        cached = self._cache.get(path)
+        if cached is not None:
+            return cached
+        res = self._compute(path)
+        if len(self._cache) >= 512:
+            self._cache.clear()
+        self._cache[path] = res
+        return res
+
+    def _compute(self, path: Path) -> bool:
+        entry = _find_mount_entry(path)
+        if entry is None or not entry.device.startswith("/dev/"):
+            return False
+        # The root OS volume is never an attached network disk image.
+        if entry.mountpoint == "/":
+            return False
+
+        target_disk = _whole_disk(entry.device)
+        for img in _parsed_disk_images():
+            if entry.mountpoint in img.mountpoints or (
+                target_disk and target_disk in img.whole_disks
+            ):
+                return is_network_fs(Path(img.image_path))
+        return False
+
+    def cache_clear(self) -> None:
+        self._cache.clear()
+        _parsed_mounts.cache_clear()
+        _parsed_disk_images.cache_clear()
+
+
+_mount_info = _MountInfoLookup()
+_is_disk_image_on_network = _DiskImageNetworkLookup()
 
 
 def fs_type(path: Path) -> str:
-    """Return the lowercase filesystem type name for the mount containing path.
-
-    Returns ``"unknown"`` if the type cannot be determined.
-    Results are cached per resolved path.
-    """
+    """Return the lowercase filesystem type name for the mount containing path."""
     return _mount_info(path)[0]
 
 
-def is_network_fs(path: Path) -> bool:
-    """Return True if path resides on a network-mounted filesystem.
+def storage_profile(path: Path) -> StorageProfile:
+    """Classify ``path`` into a ``StorageProfile`` for worker and I/O tuning.
 
-    Catches three cases:
-    1. Explicit network filesystem types (smbfs, nfs, afpfs, cifs, …).
-    2. APFS without the ``local`` flag — network-backed block storage (iSCSI).
-    3. APFS disk images (``.dmg``) whose backing file is on a network mount —
-       e.g. a ``.dmg`` stored on an SMBfs share and attached with hdiutil.
-       These appear as ``(apfs, local, …)`` in mount output but all I/O
-       ultimately traverses the network share.
-
-    Network filesystems benefit from more concurrent reader threads to hide
-    per-operation round-trip latency.
+    Distinguishes direct network shares (``NETWORK_FS`` — high per-file open/close
+    latency, benefits from 32 workers) from network-backed APFS disk images
+    (``NETWORK_DISK_IMAGE`` — encrypted/unencrypted ``.dmg`` or ``.sparsebundle``
+    over SMBfs where reads funnel through ``diskimagesiod`` and benefit from
+    moderate concurrency and sequential inode ordering).
     """
     fstype, is_local = _mount_info(path)
-    if fstype in NETWORK_FS_TYPES:
-        return True
-    # APFS without the "local" flag indicates network-backed block storage.
-    if fstype == "apfs" and not is_local:
-        return True
-    # APFS that IS "local" might still be a disk image on a network share.
-    return bool(fstype == "apfs" and is_local and _is_disk_image_on_network(path))
+    if fstype in NETWORK_FS_TYPES or (fstype == "apfs" and not is_local):
+        return StorageProfile.NETWORK_FS
+    if fstype == "apfs" and is_local and _is_disk_image_on_network(path):
+        return StorageProfile.NETWORK_DISK_IMAGE
+    if fstype in LOCAL_FS_TYPES and is_local:
+        return StorageProfile.LOCAL
+    return StorageProfile.UNKNOWN
+
+
+def is_network_fs(path: Path) -> bool:
+    """Return True if path resides on a network-mounted or network-backed filesystem."""
+    return storage_profile(path) in (
+        StorageProfile.NETWORK_FS,
+        StorageProfile.NETWORK_DISK_IMAGE,
+    )
 
 
 def is_local_fs(path: Path) -> bool:
-    """Return True if path resides on a known local block-device filesystem.
-
-    Returns False for network mounts, for APFS lacking the ``local`` flag,
-    and for filesystems whose type cannot be determined.
-    """
+    """Return True if path resides on a known local block-device filesystem."""
     fstype, is_local = _mount_info(path)
     return fstype in LOCAL_FS_TYPES and is_local
 
 
 def is_mmap_safe(path: Path) -> bool:
-    """Return True if memory-mapped I/O is safe and efficient for this path.
-
-    mmap() raises OSError on network-mounted filesystems (SMBfs, NFS, AFP)
-    and on APFS volumes without the ``local`` flag. It is also unsafe for
-    APFS disk images backed by a network share — the block device appears
-    local but all I/O traverses the network, and a dropped connection
-    during a mapped read produces an OSError mid-hash.
-
-    Safe for: local APFS (encrypted or unencrypted), HFS+, exFAT, MSDOS,
-    NTFS, UDF — all with the ``local`` flag present and no network backing.
-    """
-    return is_local_fs(path) and not is_network_fs(path)
-
-
-@lru_cache(maxsize=64)
-def _is_disk_image_on_network(path: Path) -> bool:
-    """Return True if path is on an APFS disk image backed by a network share.
-
-    Uses ``hdiutil info -plist`` to enumerate attached disk images and find the
-    one whose device node matches the mount containing path. If the image file
-    (``.dmg``) itself lives on a network filesystem, returns True.
-
-    Example: /Volumes/archive10 is APFS (local) but its backing file is
-    /Volumes/chad-data/archive10.dmg, which is on an SMBfs mount — so all I/O
-    ultimately traverses the network.
-
-    Returns False on any error or if the mount has no disk image backing.
-    """
-    import plistlib
-
-    try:
-        # Find the device node for the mount containing path.
-        resolved = str(path.resolve())
-        mount_result = subprocess.run(
-            ["mount"], capture_output=True, text=True, timeout=2
-        )
-        device = ""
-        best_len = 0
-        for line in mount_result.stdout.splitlines():
-            # Extract device from "device on /mountpoint (..."
-            dm = re.match(r"^(/dev/\S+) on (/.+?) \(", line)
-            if not dm:
-                continue
-            mountpoint = dm.group(2)
-            if _is_under(resolved, mountpoint) and len(mountpoint) > best_len:
-                best_len = len(mountpoint)
-                device = dm.group(1)
-
-        if not device:
-            return False
-
-        # Ask hdiutil for all attached images and find the one using that device.
-        hdi_result = subprocess.run(
-            ["hdiutil", "info", "-plist"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if hdi_result.returncode != 0:
-            return False
-
-        info = plistlib.loads(hdi_result.stdout.encode())
-        for image in info.get("images", []):
-            image_path = image.get("image-path", "")
-            for entity in image.get("system-entities", []):
-                dev = entity.get("dev-entry", "")
-                # This image is backing our device — check if image-path is network.
-                if dev.startswith(device.rstrip("s0123456789")) and image_path:
-                    return is_network_fs(Path(image_path))
-        return False
-    except Exception:
-        return False
+    """Return True if memory-mapped I/O is safe and efficient for this path."""
+    return storage_profile(path) == StorageProfile.LOCAL
 
 
 def _is_under(path_str: str, mountpoint: str) -> bool:

@@ -308,3 +308,39 @@ class TestDupesCLI:
         verbose = runner.invoke(app, ["dupes", str(tmp_path), "--verbose", "--format", "json"])
 
         assert json.loads(quiet.output)["summary"] == json.loads(verbose.output)["summary"]
+
+    def test_dupes_prehash_skips_full_hash_for_large_non_duplicates(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:  # type: ignore[no-untyped-def]
+        from fcompare.engine import hasher
+
+        # 512 KB (> PREHASH_MIN_SIZE): two non-dupes + two true dupes + two tricky
+        # files with identical head+tail but different middle bytes.
+        size = 512 * 1024
+        (tmp_path / "non_dup_1.bin").write_bytes(b"A" * size)
+        (tmp_path / "non_dup_2.bin").write_bytes(b"B" * size)
+
+        dup_payload = b"D" * size
+        (tmp_path / "true_dup_1.bin").write_bytes(dup_payload)
+        (tmp_path / "true_dup_2.bin").write_bytes(dup_payload)
+
+        tricky_head = b"H" * (128 * 1024)
+        tricky_tail = b"T" * (128 * 1024)
+        (tmp_path / "mid_diff_1.bin").write_bytes(tricky_head + b"1" * (256 * 1024) + tricky_tail)
+        (tmp_path / "mid_diff_2.bin").write_bytes(tricky_head + b"2" * (256 * 1024) + tricky_tail)
+
+        full_hashed: list[str] = []
+        orig_hash_file = hasher.hash_file
+
+        def tracking_hash(path: Path) -> str:
+            full_hashed.append(path.name)
+            return orig_hash_file(path)
+
+        monkeypatch.setattr(hasher, "hash_file", tracking_hash)
+
+        groups = find_duplicates(tmp_path, WalkOptions())
+        assert len(groups) == 1
+        assert {r.path.name for r in groups[0].files} == {"true_dup_1.bin", "true_dup_2.bin"}
+        # non_dup_1 and non_dup_2 must be eliminated before full hash_file()!
+        assert "non_dup_1.bin" not in full_hashed
+        assert "non_dup_2.bin" not in full_hashed

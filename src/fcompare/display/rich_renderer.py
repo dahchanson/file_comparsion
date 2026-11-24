@@ -26,7 +26,10 @@ def render_diff_rich(result: DiffResult, show: ShowFilter) -> None:
 
     if show in (ShowFilter.all, ShowFilter.modified):
         for left, right in result.modified:
-            label = f"~ modified   {left.sha256[:8]}…  →  {right.sha256[:8]}…"
+            if left.sha256 and right.sha256:
+                label = f"~ modified   {left.sha256[:8]}…  →  {right.sha256[:8]}…"
+            else:
+                label = f"~ modified   {_human_bytes(left.size)}  →  {_human_bytes(right.size)}"
             rows.append(_diff_row("~", "yellow", "modified ", str(left.rel_path), label))
 
     if show in (ShowFilter.all, ShowFilter.unique):

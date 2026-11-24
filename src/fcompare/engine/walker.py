@@ -1,6 +1,8 @@
 """Recursive directory walker that yields FileRecord objects."""
 
 import fnmatch
+import os
+import re
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -9,7 +11,7 @@ from pathlib import Path
 from fcompare.engine.models import FileRecord
 
 
-@dataclass
+@dataclass(slots=True)
 class WalkOptions:
     """Controls which files the walker includes or skips."""
 
@@ -22,10 +24,15 @@ class WalkOptions:
 def walk(root: Path, options: WalkOptions | None = None) -> Iterator[FileRecord]:
     """Yield a FileRecord for every file under ``root`` that passes all filters.
 
-    Files that raise OSError (including PermissionError, network timeouts, and
-    disconnected SMBfs mounts) are skipped with a warning. Directories are
-    never yielded — only regular files (or symlinks to files when
-    follow_symlinks is True).
+    Uses an iterative ``os.scandir`` traversal so:
+      - Hidden and excluded directories (e.g. ``.git``, ``.Spotlight-V100``,
+        ``node_modules``) are pruned *before* descending into them, avoiding
+        unnecessary catalog B-tree faults on SMB-backed APFS volumes.
+      - Entry types come from ``readdir`` ``d_type`` without extra ``lstat``/``stat``
+        syscalls, requiring only a single ``DirEntry.stat()`` per yielded file.
+
+    Files or directories that raise OSError (including PermissionError, network
+    timeouts, and disconnected SMBfs mounts) are skipped with a warning.
 
     Args:
         root: Directory to walk. Must exist.
@@ -34,59 +41,86 @@ def walk(root: Path, options: WalkOptions | None = None) -> Iterator[FileRecord]
     if options is None:
         options = WalkOptions()
 
-    candidates = root.rglob("*") if options.recurse else root.iterdir()
+    exclude_re = _compile_excludes(options.exclude_patterns)
+    include_hidden = options.include_hidden
+    follow_symlinks = options.follow_symlinks
+    recurse = options.recurse
 
-    for entry in candidates:
-        # Resolve symlink status before any other check.
-        is_symlink = entry.is_symlink()
-        if is_symlink and not options.follow_symlinks:
-            continue
+    root_str = os.fspath(root)
+    prefix_len = len(root_str) if root_str.endswith(os.sep) else len(root_str) + 1
 
-        # Only yield regular files (or symlinks-to-files when allowed).
+    visited_dirs: set[tuple[int, int]] | None = None
+    if follow_symlinks and recurse:
         try:
-            if not entry.is_file():
-                continue
+            st_root = os.stat(root_str)
+            visited_dirs = {(st_root.st_dev, st_root.st_ino)}
         except OSError:
-            warnings.warn(f"Cannot access, skipping: {entry}", stacklevel=2)
-            continue
+            visited_dirs = set()
 
-        # Skip hidden files/directories (any path component starting with ".").
-        if not options.include_hidden and _has_hidden_component(entry, root):
-            continue
+    stack: list[str] = [root_str]
 
-        # Skip entries that match any exclude glob pattern.
-        if _matches_any_exclude(entry, options.exclude_patterns):
-            continue
-
+    while stack:
+        cur_dir = stack.pop()
         try:
-            stat = entry.stat(follow_symlinks=options.follow_symlinks)
+            sc_it = os.scandir(cur_dir)
         except OSError:
-            warnings.warn(f"Cannot stat, skipping: {entry}", stacklevel=2)
+            warnings.warn(f"Cannot access directory, skipping: {cur_dir}", stacklevel=2)
             continue
 
-        yield FileRecord(
-            path=entry,
-            rel_path=entry.relative_to(root),
-            size=stat.st_size,
-            mtime=stat.st_mtime,
-        )
+        with sc_it:
+            for entry in sc_it:
+                name = entry.name
+
+                # Fast name check before any stat/lstat syscall: prunes hidden files
+                # AND hidden directories (.git, .Spotlight-V100, .Trashes, ._*).
+                if not include_hidden and name.startswith("."):
+                    continue
+
+                entry_path = entry.path
+                rel_str = entry_path[prefix_len:]
+
+                # Prune excluded files AND excluded directories before descending.
+                if exclude_re is not None and (
+                    exclude_re.match(name)
+                    or exclude_re.match(rel_str)
+                    or exclude_re.match(entry_path)
+                ):
+                    continue
+
+                try:
+                    if entry.is_symlink() and not follow_symlinks:
+                        continue
+
+                    if entry.is_dir(follow_symlinks=follow_symlinks):
+                        if recurse:
+                            if visited_dirs is not None:
+                                dir_st = entry.stat(follow_symlinks=True)
+                                dev_ino = (dir_st.st_dev, dir_st.st_ino)
+                                if dev_ino in visited_dirs:
+                                    continue
+                                visited_dirs.add(dev_ino)
+                            stack.append(entry_path)
+                        continue
+
+                    if not entry.is_file(follow_symlinks=follow_symlinks):
+                        continue
+
+                    stat = entry.stat(follow_symlinks=follow_symlinks)
+                except OSError:
+                    warnings.warn(f"Cannot access, skipping: {entry_path}", stacklevel=2)
+                    continue
+
+                yield FileRecord(
+                    path=Path(entry_path),
+                    rel_path=Path(rel_str),
+                    size=stat.st_size,
+                    mtime=stat.st_mtime,
+                    ino=stat.st_ino,
+                )
 
 
-def _has_hidden_component(path: Path, root: Path) -> bool:
-    """Return True if any component of path (relative to root) starts with '.'."""
-    try:
-        rel = path.relative_to(root)
-    except ValueError:  # pragma: no cover — path always comes from root.rglob()
-        return False
-    return any(part.startswith(".") for part in rel.parts)
-
-
-def _matches_any_exclude(path: Path, patterns: list[str]) -> bool:
-    """Return True if the file name or any path component matches an exclude pattern."""
-    for pattern in patterns:
-        if fnmatch.fnmatch(path.name, pattern):
-            return True
-        # Also allow matching against full relative-path string for patterns like "dir/*".
-        if fnmatch.fnmatch(str(path), pattern):
-            return True
-    return False
+def _compile_excludes(patterns: list[str]) -> re.Pattern[str] | None:
+    """Compile glob patterns into a single regex, or None if empty."""
+    if not patterns:
+        return None
+    return re.compile("|".join(f"(?:{fnmatch.translate(p)})" for p in patterns))

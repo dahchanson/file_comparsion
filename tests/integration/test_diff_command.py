@@ -284,3 +284,63 @@ class TestDiffCLI:
         )
 
         assert json.loads(quiet.output)["summary"] == json.loads(verbose.output)["summary"]
+
+    def test_diff_skips_hashing_unique_files(self, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from fcompare.engine import hasher
+
+        left = tmp_path / "left"
+        right = tmp_path / "right"
+        make_tree(left, {"shared.txt": "same", "only_l.txt": "never hash me"})
+        make_tree(right, {"shared.txt": "same", "only_r.txt": "never hash me either"})
+
+        hashed_names: list[str] = []
+        orig_hash_file = hasher.hash_file
+
+        def tracking_hash(path: Path) -> str:
+            hashed_names.append(path.name)
+            return orig_hash_file(path)
+
+        monkeypatch.setattr(hasher, "hash_file", tracking_hash)
+
+        res = compare_directories(left, right, WalkOptions())
+        assert len(res.identical) == 1
+        assert len(res.only_in_left) == 1
+        assert len(res.only_in_right) == 1
+        assert set(hashed_names) == {"shared.txt"}
+
+    def test_diff_fast_flag_skips_hashing_size_mismatched_files(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:  # type: ignore[no-untyped-def]
+        from fcompare.engine import hasher
+
+        left = tmp_path / "left"
+        right = tmp_path / "right"
+        make_tree(left, {"diff_size.txt": "short", "same.txt": "ok"})
+        make_tree(right, {"diff_size.txt": "much longer content", "same.txt": "ok"})
+
+        hashed_names: list[str] = []
+        orig_hash_file = hasher.hash_file
+
+        def tracking_hash(path: Path) -> str:
+            hashed_names.append(path.name)
+            return orig_hash_file(path)
+
+        monkeypatch.setattr(hasher, "hash_file", tracking_hash)
+
+        result = runner.invoke(app, ["diff", str(left), str(right), "--fast"])
+        assert result.exit_code == 0
+        assert "modified" in result.output
+        assert set(hashed_names) == {"same.txt"}
+
+    def test_diff_cross_device_concurrent_path(self, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        import fcompare.commands.diff as diff_mod
+
+        left = tmp_path / "left"
+        right = tmp_path / "right"
+        make_tree(left, {"a.txt": "same", "b.txt": "v1"})
+        make_tree(right, {"a.txt": "same", "b.txt": "v2"})
+
+        monkeypatch.setattr(diff_mod, "_same_device", lambda _l, _r: False)
+        res = compare_directories(left, right, WalkOptions())
+        assert len(res.identical) == 1
+        assert len(res.modified) == 1

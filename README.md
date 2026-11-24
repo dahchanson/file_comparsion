@@ -1,6 +1,6 @@
 # fcompare
 
-A macOS CLI utility for comparing directories and finding duplicate files by SHA-256 hash.
+A fast macOS CLI utility for comparing directories and finding duplicate files by SHA-256 hash — optimized for both local Apple Silicon NVMe storage and network-mounted / encrypted APFS volumes over SMBfs.
 
 ## Installation
 
@@ -11,8 +11,8 @@ pipx install fcompare
 Or install from source:
 
 ```bash
-git clone <repo>
-cd fcompare
+git clone https://github.com/dahchanson/file_comparsion.git
+cd file_comparsion
 pipx install .
 ```
 
@@ -20,8 +20,10 @@ pipx install .
 
 ### `fcompare diff` — Compare two directories
 
-Recursively compares all files in two directories by SHA-256 hash and reports which files are
-identical, modified, or unique to one side.
+Recursively compares files in two directories by relative path, size, and SHA-256 hash, reporting which files are identical, modified, or unique to one side.
+
+- Files unique to either directory are classified immediately without reading file contents.
+- When comparing across separate devices (e.g., local NVMe vs. an external drive or SMB-mounted APFS volume), walking and hashing run concurrently with per-device I/O tuning.
 
 ```bash
 fcompare diff <left-dir> <right-dir> [OPTIONS]
@@ -31,17 +33,22 @@ fcompare diff <left-dir> <right-dir> [OPTIONS]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--format [rich\|json]` | `rich` | Output format |
-| `--show [all\|modified\|unique\|same]` | `all` | Filter which categories to display |
+| `--format, -f [rich\|json]` | `rich` | Output format |
+| `--show, -s [all\|modified\|unique\|same]` | `all` | Filter which categories to display |
 | `--recurse / --no-recurse` | recurse | Walk subdirectories |
-| `--exclude PATTERN` | — | Glob pattern to skip (repeatable) |
+| `--exclude, -e PATTERN` | — | Glob pattern to skip (repeatable) |
 | `--follow-symlinks` | off | Follow symbolic links |
+| `--fast` | off | Skip hashing shared files whose byte sizes already differ |
+| `--verbose, -v` | off | Show live scan and hashing progress bars |
 
 **Examples:**
 
 ```bash
 # Compare two directories, show everything
 fcompare diff ~/Documents/v1 ~/Documents/v2
+
+# Fast comparison against a network-mounted backup with live progress
+fcompare diff ~/Photos /Volumes/Archive/Photos --fast --verbose
 
 # Show only files that differ
 fcompare diff ~/project-a ~/project-b --show modified
@@ -59,7 +66,7 @@ fcompare diff dir1/ dir2/ --format json | jq '.summary'
 Directory Comparison: /path/to/dir1  ↔  /path/to/dir2
 ────────────────────────────────────────────────────────
   [✓] same        docs/readme.md
-  [~] modified    src/config.py
+  [~] modified    src/config.py  ~ modified   a3f8c2d1…  →  91b4e077…
   [+] only left   src/legacy.py
   [-] only right  src/new_feature.py
 ────────────────────────────────────────────────────────
@@ -70,8 +77,10 @@ Directory Comparison: /path/to/dir1  ↔  /path/to/dir2
 
 ### `fcompare dupes` — Find duplicate files
 
-Scans a directory for files with identical SHA-256 hashes. Uses a size-first pre-filter to
-minimize I/O: only files that share a size with another file are actually hashed.
+Scans a directory for files with identical SHA-256 hashes using a three-stage filter to minimize disk and network I/O:
+1. **Size grouping** during directory traversal (eliminates uniquely-sized files with zero reads).
+2. **Partial head+tail pre-hash** (4 KB-aligned 64 KB start + 64 KB end) for large size-colliding files (`> 256 KB`), rejecting fixed-size non-duplicates (such as `.sparsebundle` bands or uncompressed media frames) before reading full files.
+3. **Full SHA-256 verification** for surviving candidates.
 
 ```bash
 fcompare dupes <directory> [OPTIONS]
@@ -81,19 +90,20 @@ fcompare dupes <directory> [OPTIONS]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--format [rich\|json]` | `rich` | Output format |
+| `--format, -f [rich\|json]` | `rich` | Output format |
 | `--min-size BYTES` | `1` | Skip files smaller than this many bytes |
-| `--exclude PATTERN` | — | Glob pattern to skip (repeatable) |
+| `--exclude, -e PATTERN` | — | Glob pattern to skip (repeatable) |
 | `--recurse / --no-recurse` | recurse | Walk subdirectories |
 | `--follow-symlinks` | off | Follow symbolic links |
+| `--verbose, -v` | off | Show live scan, size-filter reduction, and hashing progress |
 | `--delete-keep [oldest\|newest\|first]` | — | Print a deletion plan (does not delete) |
 | `--confirm` | off | Execute the deletion plan (requires `--delete-keep`) |
 
 **Examples:**
 
 ```bash
-# Find all duplicate files
-fcompare dupes ~/Downloads
+# Find all duplicate files with live progress
+fcompare dupes ~/Downloads --verbose
 
 # Find duplicate files larger than 1 MB
 fcompare dupes ~/Photos --min-size 1048576
@@ -128,6 +138,16 @@ Duplicate Files in: /path/to/dir
 
 ---
 
+### `fcompare benchmark` — Hardware & I/O Throughput Benchmark
+
+Benchmarks SHA-256, SHA-512, and optional BLAKE3 (`pip install 'fcompare[benchmark]'`) across chunk sizes and I/O strategies on your hardware.
+
+```bash
+fcompare benchmark --size-mb 256 --iterations 3
+```
+
+---
+
 ## Development
 
 ```bash
@@ -140,7 +160,7 @@ make lint
 # Run test suite
 make test
 
-# Run tests with coverage report
+# Run tests with coverage report (≥ 90% required)
 make test-cov
 
 # Build a distributable wheel

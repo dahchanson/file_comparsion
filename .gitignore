@@ -7,8 +7,6 @@ build/
 *.pyd
 .Python
 *.egg-info/
-dist/
-build/
 .eggs/
 
 # Virtual environments

@@ -192,19 +192,75 @@ class TestWalkSymlinks:
 
 
 class TestWalkPermissionErrors:
-    def test_permission_error_on_file_emits_warning_and_continues(
+    def test_permission_error_on_scandir_emits_warning_and_continues(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        import os
+
+        make_tree(tmp_path, {"good_dir": {"good.txt": "g"}, "bad_dir": {"secret.txt": "s"}})
+        original_scandir = os.scandir
+
+        def flaky_scandir(path: str):  # type: ignore[no-untyped-def]
+            if Path(path).name == "bad_dir":
+                raise PermissionError("directory denied")
+            return original_scandir(path)
+
+        monkeypatch.setattr("fcompare.engine.walker.os.scandir", flaky_scandir)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            records = list(walk(tmp_path))
+
+        names = {r.rel_path.name for r in records}
+        assert names == {"good.txt"}
+        assert any("bad_dir" in str(w.message) for w in caught)
+
+    def test_permission_error_on_entry_emits_warning_and_continues(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import os
+
         make_tree(tmp_path, {"good.txt": "g", "bad.txt": "b"})
+        original_scandir = os.scandir
 
-        original_is_file = Path.is_file
+        class FlakyDirEntry:
+            def __init__(self, inner: os.DirEntry[str]) -> None:
+                self._inner = inner
+                self.name = inner.name
+                self.path = inner.path
 
-        def flaky_is_file(self: Path) -> bool:
-            if self.name == "bad.txt":
-                raise PermissionError("denied")
-            return original_is_file(self)
+            def is_symlink(self) -> bool:
+                return self._inner.is_symlink()
 
-        monkeypatch.setattr(Path, "is_file", flaky_is_file)
+            def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+                return self._inner.is_dir(follow_symlinks=follow_symlinks)
+
+            def is_file(self, *, follow_symlinks: bool = True) -> bool:
+                if self.name == "bad.txt":
+                    raise PermissionError("denied")
+                return self._inner.is_file(follow_symlinks=follow_symlinks)
+
+            def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+                return self._inner.stat(follow_symlinks=follow_symlinks)
+
+        class FlakyScandirIter:
+            def __init__(self, inner_it: object) -> None:
+                self._it = inner_it
+
+            def __enter__(self) -> "FlakyScandirIter":
+                self._it.__enter__()  # type: ignore[attr-defined]
+                return self
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return (FlakyDirEntry(e) for e in self._it)  # type: ignore[attr-defined]
+
+            def __exit__(self, *exc: object) -> None:
+                self._it.__exit__(*exc)  # type: ignore[attr-defined]
+
+        monkeypatch.setattr(
+            "fcompare.engine.walker.os.scandir",
+            lambda p: FlakyScandirIter(original_scandir(p)),
+        )
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -215,34 +271,44 @@ class TestWalkPermissionErrors:
         assert "bad.txt" not in names
         assert any("bad.txt" in str(w.message) for w in caught)
 
-    def test_permission_error_on_stat_emits_warning_and_continues(
+    def test_prunes_hidden_and_excluded_directories_without_descending(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        make_tree(tmp_path, {"good.txt": "g", "bad.txt": "b"})
+        import os
 
-        original_stat = Path.stat
-        # is_symlink() calls stat(follow_symlinks=False) internally; so does the explicit
-        # entry.stat() call in the walker.  We let the first lstat call through (for
-        # is_symlink) and raise on the second (the walker's explicit stat call).
-        lstat_calls: dict[str, int] = {}
+        make_tree(
+            tmp_path,
+            {
+                "visible": {"ok.txt": "1"},
+                ".Spotlight-V100": {"index.db": "2"},
+                "node_modules": {"pkg": {"index.js": "3"}},
+            },
+        )
+        scanned_dirs: list[str] = []
+        original_scandir = os.scandir
 
-        def flaky_stat(self: Path, *, follow_symlinks: bool = True) -> object:
-            if self.name == "bad.txt" and not follow_symlinks:
-                lstat_calls[str(self)] = lstat_calls.get(str(self), 0) + 1
-                if lstat_calls[str(self)] > 1:
-                    raise PermissionError("stat denied")
-            return original_stat(self, follow_symlinks=follow_symlinks)
+        def tracking_scandir(path: str):  # type: ignore[no-untyped-def]
+            scanned_dirs.append(Path(path).name)
+            return original_scandir(path)
 
-        monkeypatch.setattr(Path, "stat", flaky_stat)
+        monkeypatch.setattr("fcompare.engine.walker.os.scandir", tracking_scandir)
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            records = list(walk(tmp_path))
+        opts = WalkOptions(exclude_patterns=["node_modules"])
+        records = list(walk(tmp_path, opts))
 
-        names = {r.rel_path.name for r in records}
-        assert "good.txt" in names
-        assert "bad.txt" not in names
-        assert any("bad.txt" in str(w.message) for w in caught)
+        assert [r.rel_path for r in records] == [Path("visible/ok.txt")]
+        assert ".Spotlight-V100" not in scanned_dirs
+        assert "node_modules" not in scanned_dirs
+
+    def test_follow_symlinks_avoids_infinite_directory_cycle(self, tmp_path: Path) -> None:
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "f.txt").write_bytes(b"ok")
+        (sub / "loop").symlink_to(tmp_path)
+
+        records = list(walk(tmp_path, WalkOptions(follow_symlinks=True)))
+        assert len(records) == 1
+        assert records[0].ino > 0
 
     def test_exclude_full_path_pattern_filters_nested_file(self, tmp_path: Path) -> None:
         make_tree(tmp_path, {"keep.txt": "k", "sub": {"drop.txt": "d"}})
@@ -252,3 +318,10 @@ class TestWalkPermissionErrors:
         names = {r.rel_path.name for r in records}
         assert "keep.txt" in names
         assert "drop.txt" not in names
+
+    def test_exclude_relative_path_glob_filters_nested_file(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {"keep.txt": "k", "sub": {"drop.txt": "d"}})
+        opts = WalkOptions(exclude_patterns=["sub/*.txt"])
+        records = list(walk(tmp_path, opts))
+        names = {r.rel_path.name for r in records}
+        assert names == {"keep.txt"}

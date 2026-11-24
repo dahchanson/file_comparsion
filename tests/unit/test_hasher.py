@@ -7,17 +7,21 @@ from unittest.mock import patch
 
 import pytest
 
+from fcompare.engine.fs_info import StorageProfile
 from fcompare.engine.hasher import (
+    _DISK_IMAGE_NETWORK_WORKER_COUNT,
     _NETWORK_WORKER_COUNT,
     CHUNK_SIZE,
     hash_file,
     hash_records,
+    partial_hash_file,
+    prehash_records,
 )
 from fcompare.engine.models import FileRecord
 
 
-def make_record(path: Path, size: int = 0) -> FileRecord:
-    return FileRecord(path=path, rel_path=path.name, size=size, mtime=0.0)  # type: ignore[arg-type]
+def make_record(path: Path, size: int = 0, ino: int = 0) -> FileRecord:
+    return FileRecord(path=path, rel_path=path.name, size=size, mtime=0.0, ino=ino)  # type: ignore[arg-type]
 
 
 def expected_sha256(data: bytes) -> str:
@@ -256,8 +260,10 @@ class TestHashRecords:
                 captured_workers.append(max_workers or 0)
                 super().__init__(max_workers=max_workers, **kw)
 
-        with patch("fcompare.engine.hasher.is_network_fs", return_value=False), \
-             patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor):
+        with (
+            patch("fcompare.engine.hasher.storage_profile", return_value=StorageProfile.LOCAL),
+            patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor),
+        ):
             hash_records(records)
 
         assert captured_workers[0] == (os.cpu_count() or 1)
@@ -279,8 +285,12 @@ class TestHashRecords:
                 captured_workers.append(max_workers or 0)
                 super().__init__(max_workers=max_workers, **kw)
 
-        with patch("fcompare.engine.hasher.is_network_fs", return_value=True), \
-             patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor):
+        with (
+            patch(
+                "fcompare.engine.hasher.storage_profile", return_value=StorageProfile.NETWORK_FS
+            ),
+            patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor),
+        ):
             hash_records(records)
 
         assert len(captured_workers) == 1
@@ -304,11 +314,78 @@ class TestHashRecords:
                 captured_workers.append(max_workers or 0)
                 super().__init__(max_workers=max_workers, **kw)
 
-        with patch("fcompare.engine.hasher.is_network_fs", return_value=True), \
-             patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor):
+        with (
+            patch(
+                "fcompare.engine.hasher.storage_profile", return_value=StorageProfile.NETWORK_FS
+            ),
+            patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor),
+        ):
             hash_records(records)
 
         assert captured_workers[0] == 3  # min(3, _NETWORK_WORKER_COUNT)
 
+    def test_network_disk_image_uses_moderate_workers_and_inode_order(
+        self, tmp_path: Path
+    ) -> None:
+        files = [tmp_path / f"f{i}.txt" for i in range(10)]
+        for f in files:
+            f.write_bytes(b"x")
+        # Reverse inode numbers so inode order differs from input/size order.
+        records = [make_record(f, size=i * 100, ino=1000 - i) for i, f in enumerate(files)]
+
+        captured_workers: list[int] = []
+        hashed_order: list[Path] = []
+        original_executor = __import__(
+            "concurrent.futures", fromlist=["ThreadPoolExecutor"]
+        ).ThreadPoolExecutor
+        original_hash_file = hash_file
+
+        class CapturingExecutor(original_executor):  # type: ignore[misc]
+            def __init__(self, max_workers: int | None = None, **kw: object) -> None:
+                captured_workers.append(max_workers or 0)
+                # Force 1 worker inside super() so call sequence reflects exact queue order.
+                super().__init__(max_workers=1, **kw)
+
+        def recording_hash(p: Path) -> str:
+            hashed_order.append(p)
+            return original_hash_file(p)
+
+        with (
+            patch(
+                "fcompare.engine.hasher.storage_profile",
+                return_value=StorageProfile.NETWORK_DISK_IMAGE,
+            ),
+            patch("fcompare.engine.hasher.ThreadPoolExecutor", CapturingExecutor),
+            patch("fcompare.engine.hasher.hash_file", side_effect=recording_hash),
+        ):
+            hash_records(records)
+
+        assert captured_workers[0] == _DISK_IMAGE_NETWORK_WORKER_COUNT
+        # Must be consumed in ascending inode order (f9 -> f0).
+        assert hashed_order == list(reversed(files))
+
     def test_chunk_size_is_1mb(self) -> None:
         assert CHUNK_SIZE == 1 * 1024 * 1024
+
+
+class TestPartialHash:
+    def test_distinguishes_large_files_differing_at_tail(self, tmp_path: Path) -> None:
+        size = 300 * 1024
+        f1 = tmp_path / "a.bin"
+        f2 = tmp_path / "b.bin"
+        f1.write_bytes(b"A" * (size - 1) + b"1")
+        f2.write_bytes(b"A" * (size - 1) + b"2")
+
+        assert partial_hash_file(f1, size) != partial_hash_file(f2, size)
+
+    def test_prehash_records_handles_empty_and_unreadable(self, tmp_path: Path) -> None:
+        assert prehash_records([]) == []
+        good = tmp_path / "good.bin"
+        good.write_bytes(b"x" * 1024)
+        missing = tmp_path / "missing.bin"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            res = prehash_records([make_record(good, 1024), make_record(missing, 1024)])
+        assert len(res) == 1
+        assert res[0][0].path == good
+        assert len(caught) == 1

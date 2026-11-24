@@ -4,12 +4,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-@dataclass
+@dataclass(slots=True)
 class FileRecord:
     """Represents a single file discovered during a directory walk.
 
     ``sha256`` is empty string until the hasher populates it.
     ``rel_path`` is relative to the walk root, used as the key for cross-directory comparison.
+    ``ino`` is the filesystem inode number (0 when unknown), used to preserve physical
+    allocation order on network-backed APFS disk images.
     """
 
     path: Path
@@ -17,6 +19,7 @@ class FileRecord:
     size: int
     mtime: float
     sha256: str = field(default="")
+    ino: int = field(default=0)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, FileRecord):
@@ -27,7 +30,7 @@ class FileRecord:
         return hash(self.path)
 
 
-@dataclass
+@dataclass(slots=True)
 class DiffResult:
     """Result produced by the ``diff`` command comparing two directory trees."""
 
@@ -50,7 +53,7 @@ class DiffResult:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class DupeGroup:
     """A set of files that share an identical SHA-256 digest.
 

@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/chanson/fcompare"
+Repository = "https://github.com/dahchanson/file_comparsion"
 
 [project.scripts]
 fcompare = "fcompare.cli:app"
@@ -72,6 +72,7 @@ module = "fcompare.commands.benchmark"
 ignore_errors = true
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "--tb=short"
 
